@@ -1,7 +1,8 @@
 /**
  * Wire shapes copied from packages/contracts in T3 Code, trimmed to the fields
  * this server reads. Everything crossing the wire is plain JSON on the encoded
- * side, so these are structural mirrors rather than schema imports.
+ * side, so these are structural mirrors rather than schema imports. The few
+ * fields we branch on are checked at runtime in `assertThreadShape`.
  */
 
 export interface ModelSelection {
@@ -18,27 +19,20 @@ export interface ProjectShell {
   title: string;
   workspaceRoot: string;
   defaultModelSelection: ModelSelection | null;
-  createdAt: string;
-  updatedAt: string;
 }
 
 export interface LatestTurn {
   turnId: string;
-  state: "running" | "interrupted" | "completed" | "error";
-  requestedAt: string;
+  // T3 defines more states than we compare against; only "running" matters here.
+  state: "running" | "interrupted" | "completed" | "error" | (string & {});
   startedAt: string | null;
   completedAt: string | null;
   assistantMessageId: string | null;
 }
 
 export interface Session {
-  threadId: string;
-  status: "idle" | "starting" | "running" | "ready" | "interrupted" | "stopped" | "error";
-  providerName: string | null;
-  providerInstanceId?: string;
-  activeTurnId: string | null;
+  status: string;
   lastError: string | null;
-  updatedAt: string;
 }
 
 export interface ThreadShell {
@@ -51,11 +45,9 @@ export interface ThreadShell {
   branch: string | null;
   worktreePath: string | null;
   latestTurn: LatestTurn | null;
-  createdAt: string;
   updatedAt: string;
   archivedAt: string | null;
   session: Session | null;
-  latestUserMessageAt: string | null;
   hasPendingApprovals: boolean;
   hasPendingUserInput: boolean;
   hasActionableProposedPlan: boolean;
@@ -65,7 +57,6 @@ export interface ShellSnapshot {
   snapshotSequence: number;
   projects: ProjectShell[];
   threads: ThreadShell[];
-  updatedAt: string;
 }
 
 export interface Message {
@@ -75,30 +66,44 @@ export interface Message {
   turnId: string | null;
   streaming: boolean;
   createdAt: string;
-  updatedAt: string;
 }
 
-export interface ThreadDetail extends Omit<ThreadShell, "latestUserMessageAt" | "hasPendingApprovals" | "hasPendingUserInput" | "hasActionableProposedPlan"> {
+export interface ThreadDetail
+  extends Omit<ThreadShell, "hasPendingApprovals" | "hasPendingUserInput" | "hasActionableProposedPlan"> {
   messages: Message[];
-  activities?: unknown[];
-  proposedPlans?: unknown[];
-  session: Session | null;
 }
 
 export interface ThreadDetailSnapshot {
   snapshotSequence: number;
   thread: ThreadDetail;
-  page?: { beforeCursor: string | null; hasMore: boolean };
+}
+
+/**
+ * Guard against silent contract drift after a T3 upgrade: if the fields the
+ * wait loop branches on vanish, fail loudly instead of reporting "done".
+ */
+export function assertThreadShape(snapshot: ThreadDetailSnapshot): ThreadDetailSnapshot {
+  const thread = snapshot?.thread as Partial<ThreadDetail> | undefined;
+  const problems: string[] = [];
+  if (!thread || typeof thread.id !== "string") problems.push("thread.id");
+  if (!Array.isArray(thread?.messages)) problems.push("thread.messages");
+  if (thread && !("latestTurn" in thread)) problems.push("thread.latestTurn");
+  const turn = thread?.latestTurn;
+  if (turn && (typeof turn.turnId !== "string" || typeof turn.state !== "string")) problems.push("thread.latestTurn.{turnId,state}");
+  if (problems.length) {
+    throw new Error(
+      `T3 thread snapshot is missing ${problems.join(", ")}. The T3 server contract may have changed; update t3-code-agent-mcp.`,
+    );
+  }
+  return snapshot;
 }
 
 export interface ProviderModel {
   slug: string;
   name: string;
-  shortName?: string;
   aliases?: string[];
   isDefault?: boolean;
   isLegacy?: boolean;
-  isCustom: boolean;
 }
 
 export interface Provider {
@@ -108,8 +113,8 @@ export interface Provider {
   enabled: boolean;
   installed: boolean;
   version: string | null;
-  status: "ready" | "warning" | "error" | "disabled";
-  auth: { status: "authenticated" | "unauthenticated" | "unknown"; label?: string };
+  status: "ready" | "warning" | "error" | "disabled" | (string & {});
+  auth: { status: "authenticated" | "unauthenticated" | "unknown" | (string & {}) };
   message?: string;
   availability?: "available" | "unavailable";
   unavailableReason?: string;
@@ -118,7 +123,6 @@ export interface Provider {
 
 export interface ServerConfig {
   providers: Provider[];
-  environment?: { environmentId?: string; label?: string; serverVersion?: string };
 }
 
 export interface VcsRef {
@@ -132,9 +136,7 @@ export interface VcsRef {
 export interface VcsListRefsResult {
   refs: VcsRef[];
   isRepo: boolean;
-  hasPrimaryRemote: boolean;
   nextCursor: number | null;
-  totalCount: number;
 }
 
 export interface DispatchResult {

@@ -20,6 +20,7 @@ export interface DiscoveredServer {
   origin: string;
   runtimeFile: string;
   pid: number;
+  environmentId: string;
   serverVersion?: string;
   label?: string;
 }
@@ -63,14 +64,15 @@ export function isProcessAlive(pid: number): boolean {
 export async function probeEnvironment(
   origin: string,
   fetchImpl: typeof fetch = fetch,
-): Promise<{ serverVersion?: string; label?: string } | null> {
+): Promise<{ environmentId: string; serverVersion?: string; label?: string } | null> {
   try {
     const response = await fetchImpl(new URL("/.well-known/t3/environment", origin), {
       signal: AbortSignal.timeout(3000),
     });
     if (!response.ok) return null;
-    const body = (await response.json()) as { serverVersion?: string; label?: string };
-    return { serverVersion: body.serverVersion, label: body.label };
+    const body = (await response.json()) as { environmentId?: string; serverVersion?: string; label?: string };
+    if (typeof body.environmentId !== "string") return null;
+    return { environmentId: body.environmentId, serverVersion: body.serverVersion, label: body.label };
   } catch {
     return null;
   }

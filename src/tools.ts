@@ -1,22 +1,23 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer, ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ShapeOutput, ZodRawShapeCompat } from "@modelcontextprotocol/sdk/server/zod-compat.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
-import { followUpIds, freshCommandId, launchIds } from "./ids.js";
-import { isProviderUsable, resolveExistingWorktree, resolveHarness, resolveModel, resolveProject } from "./resolve.js";
+import { commandIds } from "./ids.js";
+import { normalizePath, resolveExistingWorktree, resolveHarness, resolveModel, resolveProject, unusableReason } from "./resolve.js";
 import type { T3Api } from "./t3.js";
 import type { Message, ThreadDetailSnapshot, ThreadShell } from "./types.js";
 
 const RuntimeModeSchema = z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]);
 const InteractionModeSchema = z.enum(["default", "plan"]);
+const ContextSchema = z.array(z.object({ label: z.string().optional(), text: z.string() })).optional();
 
-const text = (value: unknown) => ({
-  content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
-});
-
-const failure = (error: unknown) => ({
-  isError: true as const,
-  content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }],
-});
+export interface ToolContext {
+  api: T3Api;
+  origin: string;
+  environmentId: string;
+}
 
 const composeMessage = (prompt: string, context?: Array<{ label?: string; text: string }>): string => {
   if (!context?.length) return prompt;
@@ -24,7 +25,7 @@ const composeMessage = (prompt: string, context?: Array<{ label?: string; text: 
   return `${prompt}\n\n---\n\n${blocks}`;
 };
 
-const summarizeThread = (thread: ThreadShell | ThreadDetailSnapshot["thread"], origin: string) => ({
+const summarizeThread = (thread: ThreadShell | ThreadDetailSnapshot["thread"], ctx: ToolContext) => ({
   threadId: thread.id,
   title: thread.title,
   projectId: thread.projectId,
@@ -53,7 +54,8 @@ const summarizeThread = (thread: ThreadShell | ThreadDetailSnapshot["thread"], o
         },
       }
     : {}),
-  url: `${origin}/threads/${thread.id}`,
+  // Matches the web route `/$environmentId/$threadId`.
+  url: `${ctx.origin}/${ctx.environmentId}/${thread.id}`,
 });
 
 const renderMessages = (messages: Message[], limit: number, maxChars: number) =>
@@ -75,17 +77,41 @@ const latestAssistantReply = (snapshot: ThreadDetailSnapshot): Message | null =>
   return [...snapshot.thread.messages].reverse().find((m) => m.role === "assistant") ?? null;
 };
 
-const turnResult = (snapshot: ThreadDetailSnapshot, origin: string, timedOut: boolean) => {
+const turnResult = (snapshot: ThreadDetailSnapshot, ctx: ToolContext, timedOut: boolean) => {
   const reply = latestAssistantReply(snapshot);
   return {
-    ...summarizeThread(snapshot.thread, origin),
+    ...summarizeThread(snapshot.thread, ctx),
     timedOut,
     reply: reply ? { messageId: reply.id, streaming: reply.streaming, text: reply.text } : null,
   };
 };
 
-export function registerTools(server: McpServer, api: T3Api, origin: string): void {
-  server.registerTool(
+const WAIT_DEFAULT_SECONDS = 300;
+
+/** Register one tool whose handler returns JSON or throws; errors become `isError` results. */
+function tool<Shape extends ZodRawShapeCompat>(
+  server: McpServer,
+  name: string,
+  meta: { title: string; description: string; inputSchema: Shape },
+  run: (input: ShapeOutput<Shape>) => Promise<unknown>,
+): void {
+  const callback = async (input: ShapeOutput<Shape>): Promise<CallToolResult> => {
+    try {
+      const value = await run(input);
+      return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
+    } catch (error) {
+      return { isError: true, content: [{ type: "text" as const, text: error instanceof Error ? error.message : String(error) }] };
+    }
+  };
+  // ToolCallback is a conditional type the compiler cannot narrow for a generic Shape; the shape is exact at every call site.
+  server.registerTool(name, meta, callback as unknown as ToolCallback<Shape>);
+}
+
+export function registerTools(server: McpServer, ctx: ToolContext): void {
+  const { api } = ctx;
+
+  tool(
+    server,
     "t3_list_projects",
     {
       title: "List T3 projects",
@@ -93,92 +119,81 @@ export function registerTools(server: McpServer, api: T3Api, origin: string): vo
       inputSchema: {},
     },
     async () => {
-      try {
-        const shell = await api.shell();
-        return text(
-          shell.projects.map((p) => ({
-            id: p.id,
-            title: p.title,
-            workspaceRoot: p.workspaceRoot,
-            defaultModelSelection: p.defaultModelSelection,
-          })),
-        );
-      } catch (error) {
-        return failure(error);
-      }
+      const shell = await api.shell();
+      return shell.projects.map((p) => ({
+        id: p.id,
+        title: p.title,
+        workspaceRoot: p.workspaceRoot,
+        defaultModelSelection: p.defaultModelSelection,
+      }));
     },
   );
 
-  server.registerTool(
+  tool(
+    server,
     "t3_list_worktrees",
     {
       title: "List worktrees for a project",
       description:
-        "List the git worktrees and local branches of a T3 project. The project root is always a valid worktreePath. Pass the project id, title, or workspace root.",
+        "List the git worktrees and local branches of a T3 project. The project root is always a valid worktreePath. Pass the project id, exact title, or workspace root.",
       inputSchema: { project: z.string().describe("Project id, exact title, or workspace root path") },
     },
     async ({ project }) => {
-      try {
-        const shell = await api.shell();
-        const resolved = resolveProject(shell.projects, project);
-        const refs = await api.listRefs(resolved.workspaceRoot);
-        const current = refs.refs.find((r) => r.current && !r.isRemote);
-        const worktrees = [
+      const shell = await api.shell();
+      const resolved = resolveProject(shell.projects, project);
+      const refs = await api.listRefs(resolved.workspaceRoot);
+      const root = normalizePath(resolved.workspaceRoot);
+      const current = refs.refs.find((r) => r.current && !r.isRemote);
+      return {
+        projectId: resolved.id,
+        isRepo: refs.isRepo,
+        worktrees: [
           { worktreePath: resolved.workspaceRoot, branch: current?.name ?? null, isProjectRoot: true },
           ...refs.refs
-            .filter((r) => r.worktreePath && r.worktreePath !== resolved.workspaceRoot)
+            .filter((r) => r.worktreePath && normalizePath(r.worktreePath) !== root)
             .map((r) => ({ worktreePath: r.worktreePath, branch: r.name, isProjectRoot: false })),
-        ];
-        return text({
-          projectId: resolved.id,
-          isRepo: refs.isRepo,
-          worktrees,
-          branches: refs.refs.filter((r) => !r.isRemote).map((r) => ({ name: r.name, isDefault: r.isDefault, worktreePath: r.worktreePath })),
-        });
-      } catch (error) {
-        return failure(error);
-      }
+        ],
+        branches: refs.refs.filter((r) => !r.isRemote).map((r) => ({ name: r.name, isDefault: r.isDefault, worktreePath: r.worktreePath })),
+      };
     },
   );
 
-  server.registerTool(
+  tool(
+    server,
     "t3_list_harnesses",
     {
       title: "List harnesses and models",
       description:
-        "List the coding-agent harnesses (providers) configured in T3 and the models each one offers. Only usable harnesses can start threads; unusable ones are listed with a reason.",
+        "List the coding-agent harnesses configured in T3 (T3 calls them providers; harnessId is the provider instanceId) and the models each one offers. `usable: false` entries carry a `reason` and cannot start threads.",
       inputSchema: { includeUnusable: z.boolean().optional().describe("Also list harnesses that cannot start threads right now") },
     },
     async ({ includeUnusable }) => {
-      try {
-        const config = await api.config();
-        const providers = config.providers.filter((p) => includeUnusable || isProviderUsable(p));
-        return text(
-          providers.map((p) => ({
-            harnessId: p.instanceId,
-            driver: p.driver,
-            displayName: p.displayName ?? p.instanceId,
-            usable: isProviderUsable(p) && p.auth.status !== "unauthenticated",
-            status: p.status,
-            auth: p.auth.status,
-            version: p.version,
-            reason: p.unavailableReason ?? p.message,
-            models: p.models.map((m) => ({
-              model: m.slug,
-              name: m.name,
-              aliases: m.aliases,
-              isDefault: m.isDefault ?? false,
-              isLegacy: m.isLegacy ?? false,
-            })),
+      const config = await api.config();
+      return config.providers
+        .map((p) => ({ provider: p, reason: unusableReason(p) }))
+        .filter(({ reason }) => includeUnusable || reason === null)
+        .map(({ provider: p, reason }) => ({
+          harnessId: p.instanceId,
+          driver: p.driver,
+          displayName: p.displayName ?? p.instanceId,
+          usable: reason === null,
+          reason: reason ?? undefined,
+          status: p.status,
+          auth: p.auth.status,
+          version: p.version,
+          models: p.models.map((m) => ({
+            model: m.slug,
+            name: m.name,
+            aliases: m.aliases,
+            isDefault: m.isDefault ?? false,
+            isLegacy: m.isLegacy ?? false,
           })),
-        );
-      } catch (error) {
-        return failure(error);
-      }
+        }));
     },
   );
 
-  server.registerTool(
+  tool(
+    server,
     "t3_list_threads",
     {
       title: "List threads",
@@ -190,37 +205,31 @@ export function registerTools(server: McpServer, api: T3Api, origin: string): vo
       },
     },
     async ({ project, includeArchived, limit }) => {
-      try {
-        const shell = await api.shell();
-        const projectId = project ? resolveProject(shell.projects, project).id : undefined;
-        const threads = shell.threads
-          .filter((t) => (projectId ? t.projectId === projectId : true))
-          .filter((t) => includeArchived || t.archivedAt === null)
-          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-          .slice(0, limit ?? 25);
-        return text(threads.map((t) => summarizeThread(t, origin)));
-      } catch (error) {
-        return failure(error);
-      }
+      const shell = await api.shell();
+      const projectId = project ? resolveProject(shell.projects, project).id : undefined;
+      return shell.threads
+        .filter((t) => (projectId ? t.projectId === projectId : true))
+        .filter((t) => includeArchived || t.archivedAt === null)
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        .slice(0, limit ?? 25)
+        .map((t) => summarizeThread(t, ctx));
     },
   );
 
-  server.registerTool(
+  tool(
+    server,
     "t3_create_thread",
     {
       title: "Create a T3 thread and send the first prompt",
       description:
-        "Create a new thread in T3 with an explicit project, worktree, harness, and model, then send the first prompt. The thread appears in the T3 UI. Nothing is substituted: unknown or unusable choices fail with the valid options. Pass the same idempotencyKey on retries to guarantee a single launch.",
+        "Create a new thread in T3 with an explicit project, worktree, harness, and model, then send the first prompt. The thread appears in the T3 UI. Nothing is substituted: unknown or unusable choices fail with the valid options. Pass the same idempotencyKey on retries to guarantee a single launch; a key whose command T3 rejected is burned and needs a new key.",
       inputSchema: {
         project: z.string().describe("Project id, exact title, or workspace root (see t3_list_projects)"),
         harness: z.string().describe("Harness id exactly as listed by t3_list_harnesses, e.g. claudeAgent, codex, cursor"),
         model: z.string().describe("Model slug or alias exactly as listed for that harness"),
         title: z.string().min(1).describe("Thread title shown in T3"),
         prompt: z.string().min(1).describe("First user message"),
-        context: z
-          .array(z.object({ label: z.string().optional(), text: z.string() }))
-          .optional()
-          .describe("Extra context blocks appended below the prompt"),
+        context: ContextSchema.describe("Extra context blocks appended below the prompt"),
         worktreePath: z
           .string()
           .optional()
@@ -241,21 +250,25 @@ export function registerTools(server: McpServer, api: T3Api, origin: string): vo
       },
     },
     async (input) => {
-      try {
-        if (input.worktreePath && input.newWorktree) {
-          throw new Error("Pass either worktreePath or newWorktree, not both.");
-        }
-        const [shell, config] = await Promise.all([api.shell(), api.config()]);
-        const project = resolveProject(shell.projects, input.project);
-        const harness = resolveHarness(config.providers, input.harness);
-        const model = resolveModel(harness, input.model);
-        const ids = launchIds(input.idempotencyKey);
+      if (input.worktreePath && input.newWorktree) throw new Error("Pass either worktreePath or newWorktree, not both.");
+      const [shell, config] = await Promise.all([api.shell(), api.config()]);
+      const project = resolveProject(shell.projects, input.project);
+      const harness = resolveHarness(config.providers, input.harness);
+      const model = resolveModel(harness, input.model);
+      const ids = commandIds("launch", input.idempotencyKey);
+      const runtimeMode = input.runtimeMode ?? "full-access";
+      const interactionMode = input.interactionMode ?? "default";
+      const text = composeMessage(input.prompt, input.context);
 
-        const existing = shell.threads.find((t) => t.id === ids.threadId);
-        if (existing) {
-          return text({ reused: true, idempotencyKey: ids.idempotencyKey, ...summarizeThread(existing, origin) });
+      const existing = shell.threads.find((t) => t.id === ids.threadId);
+      if (existing) {
+        // T3's bootstrap is a chain (create thread, then start the turn). If it
+        // broke between the two, the thread exists with no turn: finish the
+        // launch with the same command id rather than reporting a reuse.
+        if (!existing.latestTurn) {
+          await api.startTurn({ ...ids, text, runtimeMode: existing.runtimeMode, interactionMode: existing.interactionMode });
         }
-
+      } else {
         const refs = await api.listRefs(project.workspaceRoot);
         let branch: string | null = null;
         let worktreePath: string | null = null;
@@ -282,44 +295,42 @@ export function registerTools(server: McpServer, api: T3Api, origin: string): vo
           branch = choice.branch;
           worktreePath = choice.worktreePath;
         }
-
         await api.createThreadWithFirstTurn({
-          commandId: ids.commandId,
-          threadId: ids.threadId,
-          messageId: ids.messageId,
+          ...ids,
           projectId: project.id,
           title: input.title,
           modelSelection: { instanceId: harness.instanceId, model: model.slug },
-          runtimeMode: input.runtimeMode ?? "full-access",
-          interactionMode: input.interactionMode ?? "default",
+          runtimeMode,
+          interactionMode,
           branch,
           worktreePath,
-          text: composeMessage(input.prompt, input.context),
+          text,
           newWorktree,
         });
-
-        if (input.wait) {
-          const { snapshot, timedOut } = await api.waitForTurnSettled(ids.threadId, (input.timeoutSeconds ?? 300) * 1000);
-          return text({ reused: false, idempotencyKey: ids.idempotencyKey, ...turnResult(snapshot, origin, timedOut) });
-        }
-        const snapshot = await api.thread(ids.threadId, 1);
-        return text({ reused: false, idempotencyKey: ids.idempotencyKey, ...summarizeThread(snapshot.thread, origin) });
-      } catch (error) {
-        return failure(error);
       }
+
+      const base = { reused: existing !== undefined, idempotencyKey: ids.idempotencyKey };
+      if (input.wait) {
+        const { snapshot, timedOut } = await api.waitForTurnSettled(ids.threadId, (input.timeoutSeconds ?? WAIT_DEFAULT_SECONDS) * 1000, {
+          expectedMessageId: ids.messageId,
+        });
+        return { ...base, ...turnResult(snapshot, ctx, timedOut) };
+      }
+      return { ...base, ...summarizeThread((await api.thread(ids.threadId, 1)).thread, ctx) };
     },
   );
 
-  server.registerTool(
+  tool(
+    server,
     "t3_send_message",
     {
       title: "Send a follow-up prompt",
       description:
-        "Send another user message to an existing T3 thread, starting a new turn with the thread's current harness and model. Fails if a turn is already running.",
+        "Send another user message to an existing T3 thread, starting a new turn with the thread's current harness and model. Refuses (client-side policy, so an in-flight turn is not clobbered) if a different turn is still running; a retry with the same idempotencyKey is always safe.",
       inputSchema: {
         threadId: z.string(),
         prompt: z.string().min(1),
-        context: z.array(z.object({ label: z.string().optional(), text: z.string() })).optional(),
+        context: ContextSchema,
         runtimeMode: RuntimeModeSchema.optional().describe("Default: the thread's current mode"),
         interactionMode: InteractionModeSchema.optional().describe("Default: the thread's current mode"),
         idempotencyKey: z.string().optional().describe("Stable key; retries with the same key do not start a second turn"),
@@ -328,38 +339,38 @@ export function registerTools(server: McpServer, api: T3Api, origin: string): vo
       },
     },
     async (input) => {
-      try {
-        const before = await api.thread(input.threadId, 1);
-        const ids = followUpIds(input.threadId, input.idempotencyKey);
-        const alreadySent = before.thread.messages.some((m) => m.id === ids.messageId);
-        if (!alreadySent && before.thread.latestTurn?.state === "running") {
-          throw new Error(`Thread ${input.threadId} already has a running turn (${before.thread.latestTurn.turnId}). Wait for it or cancel it first.`);
-        }
-        if (!alreadySent) {
-          await api.startTurn({
-            commandId: ids.commandId,
-            threadId: input.threadId,
-            messageId: ids.messageId,
-            text: composeMessage(input.prompt, input.context),
-            runtimeMode: input.runtimeMode ?? before.thread.runtimeMode,
-            interactionMode: input.interactionMode ?? before.thread.interactionMode,
-          });
-        }
-        if (input.wait) {
-          const { snapshot, timedOut } = await api.waitForTurnSettled(input.threadId, (input.timeoutSeconds ?? 300) * 1000, {
-            afterTurnId: alreadySent ? undefined : (before.thread.latestTurn?.turnId ?? null),
-          });
-          return text({ reused: alreadySent, idempotencyKey: ids.idempotencyKey, ...turnResult(snapshot, origin, timedOut) });
-        }
-        const snapshot = await api.thread(input.threadId, 1);
-        return text({ reused: alreadySent, idempotencyKey: ids.idempotencyKey, ...summarizeThread(snapshot.thread, origin) });
-      } catch (error) {
-        return failure(error);
+      const before = await api.thread(input.threadId);
+      const ids = commandIds(input.threadId, input.idempotencyKey);
+      const alreadySent = before.thread.messages.some((m) => m.id === ids.messageId);
+      if (!alreadySent && before.thread.latestTurn?.state === "running") {
+        throw new Error(
+          `Thread ${input.threadId} already has a running turn (${before.thread.latestTurn.turnId}). Wait for it or cancel it first.`,
+        );
       }
+      if (!alreadySent) {
+        // Safe even if the message landed after our read: T3 replays the
+        // accepted receipt for a repeated commandId instead of starting again.
+        await api.startTurn({
+          ...ids,
+          threadId: input.threadId,
+          text: composeMessage(input.prompt, input.context),
+          runtimeMode: input.runtimeMode ?? before.thread.runtimeMode,
+          interactionMode: input.interactionMode ?? before.thread.interactionMode,
+        });
+      }
+      const base = { reused: alreadySent, idempotencyKey: ids.idempotencyKey };
+      if (input.wait) {
+        const { snapshot, timedOut } = await api.waitForTurnSettled(input.threadId, (input.timeoutSeconds ?? WAIT_DEFAULT_SECONDS) * 1000, {
+          expectedMessageId: ids.messageId,
+        });
+        return { ...base, ...turnResult(snapshot, ctx, timedOut) };
+      }
+      return { ...base, ...summarizeThread((await api.thread(input.threadId, 1)).thread, ctx) };
     },
   );
 
-  server.registerTool(
+  tool(
+    server,
     "t3_get_thread",
     {
       title: "Read a thread",
@@ -371,39 +382,36 @@ export function registerTools(server: McpServer, api: T3Api, origin: string): vo
       },
     },
     async ({ threadId, messageLimit, maxChars }) => {
-      try {
-        const snapshot = await api.thread(threadId);
-        return text({
-          ...summarizeThread(snapshot.thread, origin),
-          messages: renderMessages(snapshot.thread.messages, messageLimit ?? 10, maxChars ?? 20_000),
-        });
-      } catch (error) {
-        return failure(error);
-      }
+      const limit = messageLimit ?? 10;
+      // Each turn holds at least a user + assistant message, so this window covers `limit` messages.
+      const snapshot = await api.thread(threadId, Math.ceil(limit / 2) + 1);
+      return {
+        ...summarizeThread(snapshot.thread, ctx),
+        messages: renderMessages(snapshot.thread.messages, limit, maxChars ?? 20_000),
+      };
     },
   );
 
-  server.registerTool(
+  tool(
+    server,
     "t3_wait_for_turn",
     {
       title: "Wait for the current turn",
-      description: "Block until the thread's latest turn finishes (or the timeout passes) and return the assistant reply.",
+      description:
+        "Block until the thread's latest turn finishes (or the timeout passes) and return the assistant reply. Prefer wait=true on t3_create_thread / t3_send_message, which know exactly which turn to wait for.",
       inputSchema: {
         threadId: z.string(),
         timeoutSeconds: z.number().int().min(1).max(3600).optional().describe("Default 300"),
       },
     },
     async ({ threadId, timeoutSeconds }) => {
-      try {
-        const { snapshot, timedOut } = await api.waitForTurnSettled(threadId, (timeoutSeconds ?? 300) * 1000);
-        return text(turnResult(snapshot, origin, timedOut));
-      } catch (error) {
-        return failure(error);
-      }
+      const { snapshot, timedOut } = await api.waitForTurnSettled(threadId, (timeoutSeconds ?? WAIT_DEFAULT_SECONDS) * 1000);
+      return turnResult(snapshot, ctx, timedOut);
     },
   );
 
-  server.registerTool(
+  tool(
+    server,
     "t3_cancel_turn",
     {
       title: "Cancel the running turn",
@@ -411,18 +419,14 @@ export function registerTools(server: McpServer, api: T3Api, origin: string): vo
       inputSchema: { threadId: z.string() },
     },
     async ({ threadId }) => {
-      try {
-        const before = await api.thread(threadId, 1);
-        const turn = before.thread.latestTurn;
-        if (!turn || turn.state !== "running") {
-          return text({ cancelled: false, reason: "No turn is running.", ...summarizeThread(before.thread, origin) });
-        }
-        await api.interruptTurn(freshCommandId(), threadId, turn.turnId);
-        const { snapshot } = await api.waitForTurnSettled(threadId, 15_000, { afterTurnId: null });
-        return text({ cancelled: true, ...summarizeThread(snapshot.thread, origin) });
-      } catch (error) {
-        return failure(error);
+      const before = await api.thread(threadId, 1);
+      const turn = before.thread.latestTurn;
+      if (!turn || turn.state !== "running") {
+        return { cancelled: false, reason: "No turn is running.", ...summarizeThread(before.thread, ctx) };
       }
+      await api.interruptTurn(randomUUID(), threadId, turn.turnId);
+      const { snapshot } = await api.waitForTurnSettled(threadId, 15_000);
+      return { cancelled: true, ...summarizeThread(snapshot.thread, ctx) };
     },
   );
 }

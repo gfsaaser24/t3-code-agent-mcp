@@ -26,7 +26,7 @@ async function serve(): Promise<void> {
   const conn = await connect();
   const api = new T3Api(conn);
   const server = new McpServer({ name: "t3-code-agent-mcp", version: "0.1.0" });
-  registerTools(server, api, conn.server.origin);
+  registerTools(server, { api, origin: conn.server.origin, environmentId: conn.server.environmentId });
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write(`t3-code-agent-mcp: connected to ${conn.server.origin} (token from ${conn.tokenSource})\n`);

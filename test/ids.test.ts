@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { deterministicId, followUpIds, launchIds } from "../src/ids.js";
+import { commandIds, deterministicId } from "../src/ids.js";
+
+const launchIds = (key: string | undefined) => commandIds("launch", key);
+const followUpIds = (threadId: string, key: string | undefined) => commandIds(threadId, key);
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 

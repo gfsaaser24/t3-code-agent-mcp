@@ -12,43 +12,29 @@ export function deterministicId(namespace: string, key: string): string {
     hex.slice(0, 8),
     hex.slice(8, 12),
     `4${hex.slice(13, 16)}`,
-    `${(parseInt(hex[16]!, 16) & 0x3 | 0x8).toString(16)}${hex.slice(17, 20)}`,
+    `${((parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16)}${hex.slice(17, 20)}`,
     hex.slice(20, 32),
   ].join("-");
 }
 
-export interface LaunchIds {
+export interface CommandIds {
+  idempotencyKey: string;
   threadId: string;
   commandId: string;
   messageId: string;
-  idempotencyKey: string;
 }
 
-export function launchIds(idempotencyKey: string | undefined): LaunchIds {
+/**
+ * Ids for one logical intent. `scope` is "launch" for a new thread or the
+ * existing threadId for a follow-up, so the same key on two threads never
+ * collides. Without a key the ids are random, so only that one call is safe.
+ */
+export function commandIds(scope: string, idempotencyKey: string | undefined): CommandIds {
   const key = idempotencyKey?.trim() || randomUUID();
   return {
     idempotencyKey: key,
-    threadId: deterministicId("thread", key),
-    commandId: deterministicId("command", key),
-    messageId: deterministicId("message", key),
+    threadId: deterministicId(`thread:${scope}`, key),
+    commandId: deterministicId(`command:${scope}`, key),
+    messageId: deterministicId(`message:${scope}`, key),
   };
-}
-
-export interface FollowUpIds {
-  commandId: string;
-  messageId: string;
-  idempotencyKey: string;
-}
-
-export function followUpIds(threadId: string, idempotencyKey: string | undefined): FollowUpIds {
-  const key = idempotencyKey?.trim() || randomUUID();
-  return {
-    idempotencyKey: key,
-    commandId: deterministicId(`command:${threadId}`, key),
-    messageId: deterministicId(`message:${threadId}`, key),
-  };
-}
-
-export function freshCommandId(): string {
-  return randomUUID();
 }

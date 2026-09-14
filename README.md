@@ -21,7 +21,7 @@ It talks to the T3 server the same way the T3 web app does, over T3's own HTTP a
 Rules the server enforces:
 
 - **No silent substitution.** If the harness or model you name is unknown, disabled, not installed, or signed out, the call fails and lists the valid options. Same for projects and worktrees.
-- **No duplicate launches.** Pass an `idempotencyKey` and retries reuse the same thread (or the same turn). T3 dedupes on the derived command id, so even a retry after a crash cannot launch twice.
+- **No duplicate launches.** Pass an `idempotencyKey` and retries reuse the same thread (or the same turn). T3 dedupes on the derived command id, so even a retry after a crash cannot launch twice. If T3 *rejected* a command, that key is burned: fix the cause and call again with a new key (the error says so).
 - **Local only.** Discovery, auth, and traffic stay on your machine unless you point `T3_SERVER_URL` elsewhere.
 
 ## Install
@@ -124,7 +124,7 @@ t3_cancel_turn   {threadId}
   "prompt": "…", "newWorktree": { "baseBranch": "main" } }
 ```
 
-Every thread result includes `url`, a link that opens the thread in the T3 web UI.
+Every thread result includes `url` (`<origin>/<environmentId>/<threadId>`), the link that opens the thread in the T3 web UI.
 
 ## How it works
 
@@ -133,7 +133,8 @@ Every thread result includes `url`, a link that opens the thread in the T3 web U
 - **Commands.** `orchestration.dispatchCommand` over the WebSocket RPC with T3's typed commands (`thread.turn.start` with `bootstrap.createThread`, `thread.turn.interrupt`). The socket handler is the one that expands `bootstrap` into "create thread, then start the turn" and returns typed errors. Command ids are derived from your `idempotencyKey` with SHA-256, so the same key always yields the same `threadId`, `commandId`, and `messageId`, and T3 dedupes on `commandId`.
 - **Reads.** `GET /api/orchestration/shell` and `GET /api/orchestration/threads/:id` over HTTP.
 - **RPC.** `server.getConfig` (harnesses + models) and `vcs.listRefs` (worktrees) are WebSocket-only in T3, so a tiny client speaks the Effect RPC JSON envelope (Request / Chunk / Ack / Exit / Ping).
-- **Waiting.** Subscribes to the thread over the socket and re-reads the HTTP snapshot when a turn/session event lands; no fixed polling loop.
+- **Waiting.** One thread subscription stays open for the whole wait. When a session/settle event lands, the HTTP snapshot is re-read a few times (it lags the event by a tick). After a dispatch the wait only accepts the turn that carries your own message id, so a retry or a lagging projection cannot make it return the previous turn.
+- **Drift guard.** The few snapshot fields the wait loop branches on are checked at runtime; if a T3 upgrade renames them the tool fails loudly instead of reporting "done".
 
 ## Develop
 

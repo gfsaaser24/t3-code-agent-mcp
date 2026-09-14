@@ -1,3 +1,4 @@
+import { createServer, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket } from "ws";
 
@@ -8,18 +9,36 @@ import { T3RpcClient, T3RpcError } from "../src/rpc.js";
  * an Exit, streaming requests get Chunks gated on client Acks.
  */
 describe("T3RpcClient", () => {
+  let http: Server;
   let wss: WebSocketServer;
   let origin: string;
   let seen: Array<{ auth: string | undefined; path: string }>;
   let inbound: unknown[];
+  let interrupted: Promise<void>;
+  let onInterrupt: () => void;
+  let rejectUpgradeWith: number | null;
 
   beforeEach(async () => {
     seen = [];
     inbound = [];
-    wss = new WebSocketServer({ port: 0 });
-    await new Promise<void>((resolve) => wss.once("listening", resolve));
-    const address = wss.address();
-    if (typeof address === "string") throw new Error("unexpected address");
+    rejectUpgradeWith = null;
+    interrupted = new Promise<void>((resolve) => (onInterrupt = resolve));
+    http = createServer((_req, res) => {
+      res.statusCode = 404;
+      res.end();
+    });
+    wss = new WebSocketServer({ noServer: true });
+    http.on("upgrade", (request, socket, head) => {
+      if (rejectUpgradeWith) {
+        socket.write(`HTTP/1.1 ${rejectUpgradeWith} Nope\r\nContent-Length: 0\r\n\r\n`);
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
+    });
+    await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
+    const address = http.address();
+    if (!address || typeof address === "string") throw new Error("unexpected address");
     origin = `http://127.0.0.1:${address.port}`;
     wss.on("connection", (socket: WebSocket, request) => {
       seen.push({ auth: request.headers.authorization, path: request.url ?? "" });
@@ -29,6 +48,7 @@ describe("T3RpcClient", () => {
         inbound.push(message);
         if (message._tag === "Ping") return socket.send(JSON.stringify({ _tag: "Pong" }));
         if (message._tag === "Ack") return acked.get(String(message.requestId))?.();
+        if (message._tag === "Interrupt") return onInterrupt();
         if (message._tag !== "Request") return;
         const id = message.id as string;
         switch (message.tag) {
@@ -42,6 +62,16 @@ describe("T3RpcClient", () => {
                 exit: { _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "EnvironmentScopeRequiredError", message: "needs operate" } }] },
               }),
             );
+          case "rejected":
+            return socket.send(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: id,
+                exit: { _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "OrchestrationCommandPreviouslyRejectedError", message: "was rejected" } }] },
+              }),
+            );
+          case "protocol":
+            return socket.send(JSON.stringify({ _tag: "ClientProtocolError", error: { message: "bad frame" } }));
           case "count": {
             for (let i = 1; i <= 3; i++) {
               socket.send(JSON.stringify({ _tag: "Chunk", requestId: id, values: [{ n: i }] }));
@@ -49,10 +79,14 @@ describe("T3RpcClient", () => {
             }
             return socket.send(JSON.stringify({ _tag: "Exit", requestId: id, exit: { _tag: "Success", value: undefined } }));
           }
-          case "forever": {
+          case "forever":
             socket.send(JSON.stringify({ _tag: "Chunk", requestId: id, values: [{ n: 1 }] }));
             return;
-          }
+          case "drop":
+            socket.terminate();
+            return;
+          case "silent":
+            return;
         }
       });
     });
@@ -61,6 +95,7 @@ describe("T3RpcClient", () => {
   afterEach(async () => {
     for (const socket of wss.clients) socket.terminate();
     await new Promise<void>((resolve) => wss.close(() => resolve()));
+    await new Promise<void>((resolve) => http.close(() => resolve()));
   });
 
   it("connects to /ws with a bearer header and resolves unary calls", async () => {
@@ -72,13 +107,14 @@ describe("T3RpcClient", () => {
     client.close();
   });
 
-  it("turns tagged failures into T3RpcError with the tag and message", async () => {
+  it("turns tagged failures into T3RpcError with the tag and message, adding hints where T3 has none", async () => {
     const client = new T3RpcClient(origin, "secret");
     await expect(client.call("fail", {})).rejects.toMatchObject({
       tag: "EnvironmentScopeRequiredError",
       message: "EnvironmentScopeRequiredError: needs operate",
     });
     await expect(client.call("fail", {})).rejects.toBeInstanceOf(T3RpcError);
+    await expect(client.call("rejected", {})).rejects.toThrow(/new idempotencyKey/);
     client.close();
   });
 
@@ -98,10 +134,7 @@ describe("T3RpcClient", () => {
     let calls = 0;
     await client.stream("count", {}, () => ++calls >= 1);
     expect(calls).toBe(1);
-    // The Interrupt frame is in flight when stream() resolves locally; give the fake server a beat to receive it.
-    const sawInterrupt = () => inbound.some((m) => (m as { _tag: string })._tag === "Interrupt");
-    for (let i = 0; i < 50 && !sawInterrupt(); i++) await new Promise((r) => setTimeout(r, 10));
-    expect(sawInterrupt()).toBe(true);
+    await interrupted;
     client.close();
   });
 
@@ -111,5 +144,26 @@ describe("T3RpcClient", () => {
     await client.stream("forever", {}, () => false, 100);
     expect(Date.now() - started).toBeLessThan(2000);
     client.close();
+  });
+
+  it("rejects pending work when the socket drops, then reconnects for the next call", async () => {
+    const client = new T3RpcClient(origin, "secret");
+    await expect(client.call("drop", {})).rejects.toThrow(/WebSocket closed/);
+    expect(await client.call("echo", { ok: true })).toEqual({ ok: true });
+    expect(seen).toHaveLength(2);
+    client.close();
+  });
+
+  it("fails pending calls on ClientProtocolError and times out lost replies", async () => {
+    const client = new T3RpcClient(origin, "secret");
+    await expect(client.call("protocol", {})).rejects.toThrow(/ClientProtocolError: bad frame/);
+    await expect(client.call("silent", {}, 100)).rejects.toThrow(/timed out/);
+    client.close();
+  });
+
+  it("explains a rejected handshake as a token problem", async () => {
+    rejectUpgradeWith = 401;
+    const client = new T3RpcClient(origin, "stale");
+    await expect(client.call("echo", {})).rejects.toThrow(/rejected the stored token \(401\).*pair/);
   });
 });

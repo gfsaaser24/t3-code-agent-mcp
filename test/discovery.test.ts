@@ -33,11 +33,12 @@ describe("discovery", () => {
     const probed: string[] = [];
     const fetchImpl: typeof fetch = async (input) => {
       probed.push(String(input));
-      return new Response(JSON.stringify({ serverVersion: "9.9.9", label: "Box" }), { status: 200 });
+      return new Response(JSON.stringify({ environmentId: "env-1", serverVersion: "9.9.9", label: "Box" }), { status: 200 });
     };
     const found = await discoverServer({ env: { T3CODE_HOME: dir }, fetchImpl });
     expect(found.origin).toBe("http://127.0.0.1:4242");
     expect(found.serverVersion).toBe("9.9.9");
+    expect(found.environmentId).toBe("env-1");
     expect(probed[0]).toBe("http://127.0.0.1:4242/.well-known/t3/environment");
   });
 
@@ -56,7 +57,7 @@ describe("discovery", () => {
   it("honours T3_SERVER_URL and fails loudly when nothing answers there", async () => {
     const ok = await discoverServer({
       env: { T3_SERVER_URL: "http://localhost:5555/anything" },
-      fetchImpl: async () => new Response(JSON.stringify({ serverVersion: "1" }), { status: 200 }),
+      fetchImpl: async () => new Response(JSON.stringify({ environmentId: "env-1", serverVersion: "1" }), { status: 200 }),
     });
     expect(ok.origin).toBe("http://localhost:5555");
     await expect(

@@ -2,22 +2,23 @@ import { discoverServer, type DiscoveredServer } from "./discovery.js";
 import { resolveAccessToken } from "./credentials.js";
 import { makeHttpClient, type HttpClient } from "./http.js";
 import { T3RpcClient } from "./rpc.js";
-import type {
-  DispatchResult,
-  InteractionMode,
-  ModelSelection,
-  RuntimeMode,
-  ServerConfig,
-  ShellSnapshot,
-  ThreadDetailSnapshot,
-  VcsListRefsResult,
+import {
+  assertThreadShape,
+  type DispatchResult,
+  type InteractionMode,
+  type ModelSelection,
+  type RuntimeMode,
+  type ServerConfig,
+  type ShellSnapshot,
+  type ThreadDetailSnapshot,
+  type VcsListRefsResult,
 } from "./types.js";
 
 export interface T3Connection {
   server: DiscoveredServer;
   tokenSource: string;
   http: HttpClient;
-  rpc: T3RpcClient;
+  rpc: Pick<T3RpcClient, "call" | "stream" | "close">;
 }
 
 export async function connect(env: NodeJS.ProcessEnv = process.env): Promise<T3Connection> {
@@ -46,10 +47,33 @@ export interface ThreadCreateSpec {
   newWorktree?: { projectCwd: string; baseBranch: string; branch?: string; runSetupScript: boolean };
 }
 
+export interface TurnStartSpec {
+  commandId: string;
+  threadId: string;
+  messageId: string;
+  text: string;
+  runtimeMode: RuntimeMode;
+  interactionMode: InteractionMode;
+}
+
+export interface WaitOptions {
+  /** Only a turn that carries this user message counts as "the turn we are waiting for". */
+  expectedMessageId?: string;
+}
+
+/** Events after which the thread projection may have moved to a settled state. */
+const SETTLE_HINT_EVENTS = new Set([
+  "thread.session-set",
+  "thread.settled",
+  "thread.turn-interrupt-requested",
+  "thread.turn-diff-completed",
+]);
+
 /**
- * Thin, typed wrappers over T3's HTTP and RPC surfaces. Commands go over HTTP
- * `/api/orchestration/dispatch` (durable, idempotent on commandId); config and
- * git refs are RPC-only in T3 so they go over the socket.
+ * Typed wrappers over T3's surfaces. Reads go over HTTP snapshots. Commands go
+ * over the RPC socket, not `POST /api/orchestration/dispatch`: only the socket
+ * handler expands `bootstrap` (create thread + prepare worktree) before
+ * applying the turn, and it returns typed errors instead of a generic 500.
  */
 export class T3Api {
   constructor(private readonly conn: T3Connection) {}
@@ -58,10 +82,12 @@ export class T3Api {
     return this.conn.http.get<ShellSnapshot>("/api/orchestration/shell");
   }
 
-  thread(threadId: string, turnLimit?: number): Promise<ThreadDetailSnapshot> {
-    return this.conn.http.get<ThreadDetailSnapshot>(`/api/orchestration/threads/${encodeURIComponent(threadId)}`, {
-      turnLimit,
-    });
+  async thread(threadId: string, turnLimit?: number): Promise<ThreadDetailSnapshot> {
+    const snapshot = await this.conn.http.get<ThreadDetailSnapshot>(
+      `/api/orchestration/threads/${encodeURIComponent(threadId)}`,
+      { turnLimit },
+    );
+    return assertThreadShape(snapshot);
   }
 
   config(): Promise<ServerConfig> {
@@ -88,12 +114,6 @@ export class T3Api {
     return { ...(last as VcsListRefsResult), refs, nextCursor: null };
   }
 
-  /**
-   * Commands go over the RPC socket, not `POST /api/orchestration/dispatch`:
-   * only the socket handler expands `bootstrap` (create thread + prepare
-   * worktree) before applying the turn, and it returns typed errors instead
-   * of a generic 500.
-   */
   dispatch(command: Record<string, unknown>): Promise<DispatchResult> {
     return this.conn.rpc.call<DispatchResult>("orchestration.dispatchCommand", command);
   }
@@ -135,21 +155,14 @@ export class T3Api {
     });
   }
 
-  startTurn(input: {
-    commandId: string;
-    threadId: string;
-    messageId: string;
-    text: string;
-    runtimeMode: RuntimeMode;
-    interactionMode: InteractionMode;
-  }): Promise<DispatchResult> {
+  startTurn(spec: TurnStartSpec): Promise<DispatchResult> {
     return this.dispatch({
       type: "thread.turn.start",
-      commandId: input.commandId,
-      threadId: input.threadId,
-      message: { messageId: input.messageId, role: "user", text: input.text, attachments: [] },
-      runtimeMode: input.runtimeMode,
-      interactionMode: input.interactionMode,
+      commandId: spec.commandId,
+      threadId: spec.threadId,
+      message: { messageId: spec.messageId, role: "user", text: spec.text, attachments: [] },
+      runtimeMode: spec.runtimeMode,
+      interactionMode: spec.interactionMode,
       createdAt: new Date().toISOString(),
     });
   }
@@ -165,62 +178,65 @@ export class T3Api {
   }
 
   /**
-   * Wait until the thread's latest turn stops running. Uses the thread
-   * subscription so completion is event-driven, with a wall-clock cap.
-   * Resolves with the final snapshot either way; `timedOut` says which.
+   * Wait until the thread's latest turn stops running. One subscription stays
+   * open for the whole wait; on events that can mean "settled" the HTTP
+   * snapshot is re-read (it lags the event by a tick, so a few bounded
+   * re-reads). Resolves with the final snapshot either way; `timedOut` says
+   * which. With `expectedMessageId`, only the turn that carries that user
+   * message counts, which makes waiting after a dispatch immune to projection
+   * lag and to the previous turn still being "latest".
    */
   async waitForTurnSettled(
     threadId: string,
     timeoutMs: number,
-    options: { afterTurnId?: string | null } = {},
+    options: WaitOptions = {},
   ): Promise<{ snapshot: ThreadDetailSnapshot; timedOut: boolean }> {
-    const isSettled = (snapshot: ThreadDetailSnapshot): boolean => {
-      const turn = snapshot.thread.latestTurn;
-      if (!turn) return false;
-      // A freshly dispatched turn shows up a beat after dispatch; until then the
-      // previous, already-settled turn is still "latest" and must not count.
-      if (options.afterTurnId !== undefined && turn.turnId === options.afterTurnId) return false;
-      if (turn.state === "running") return false;
-      const assistant = turn.assistantMessageId
-        ? snapshot.thread.messages.find((m) => m.id === turn.assistantMessageId)
-        : undefined;
-      return !(assistant?.streaming ?? false);
-    };
-    const first = await this.thread(threadId, 1);
-    if (isSettled(first)) return { snapshot: first, timedOut: false };
-
     const deadline = Date.now() + timeoutMs;
-    let settled = false;
-    await this.conn.rpc.stream(
-      "orchestration.subscribeThread",
-      { threadId, turnLimit: 1, afterSequence: first.snapshotSequence },
-      (item) => {
-        const record = item as { kind?: string; event?: { type?: string } };
-        if (record.kind !== "event") return;
-        const type = record.event?.type ?? "";
-        // Any turn/session/settlement transition is a reason to re-read; the
-        // authoritative check is the HTTP snapshot, not event payload parsing.
-        if (
-          type.startsWith("thread.turn") ||
-          type.startsWith("thread.session") ||
-          type === "thread.settled" ||
-          type === "thread.message-sent"
-        ) {
-          settled = true;
+    const read = () => this.thread(threadId, 1);
+    let snapshot = await read();
+    if (isSettled(snapshot, options)) return { snapshot, timedOut: false };
+
+    while (Date.now() < deadline) {
+      let hint = false;
+      await this.conn.rpc.stream(
+        "orchestration.subscribeThread",
+        { threadId, turnLimit: 1, afterSequence: snapshot.snapshotSequence },
+        (item) => {
+          const record = item as { kind?: string; event?: { type?: string } };
+          if (record.kind !== "event" || !SETTLE_HINT_EVENTS.has(record.event?.type ?? "")) return false;
+          hint = true;
           return true;
-        }
-        return false;
-      },
-      Math.max(0, deadline - Date.now()),
-    );
-    // Re-read until the projection reflects the transition (it lags the event by a tick).
-    for (let attempt = 0; attempt < 20; attempt++) {
-      const snapshot = await this.thread(threadId, 1);
-      if (isSettled(snapshot)) return { snapshot, timedOut: false };
-      if (!settled || Date.now() > deadline) break;
-      await new Promise((resolve) => setTimeout(resolve, 250));
+        },
+        Math.max(0, deadline - Date.now()),
+      );
+      if (!hint) break; // timed out with no hint
+      for (let attempt = 0; attempt < 4; attempt++) {
+        snapshot = await read();
+        if (isSettled(snapshot, options)) return { snapshot, timedOut: false };
+        await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+      }
     }
-    if (Date.now() < deadline) return this.waitForTurnSettled(threadId, deadline - Date.now(), options);
-    return { snapshot: await this.thread(threadId, 1), timedOut: true };
+    return { snapshot: await read(), timedOut: true };
   }
 }
+
+export function isSettled(snapshot: ThreadDetailSnapshot, options: WaitOptions = {}): boolean {
+  const turn = snapshot.thread.latestTurn;
+  if (!turn) return false;
+  if (options.expectedMessageId) {
+    const ownMessage = snapshot.thread.messages.find((m) => m.id === options.expectedMessageId);
+    if (!ownMessage) return false;
+    // The user message is committed before the turn starts; until the turn
+    // exists the previous, already-settled turn is still "latest".
+    if (ownMessage.turnId && ownMessage.turnId !== turn.turnId) return false;
+    if (!ownMessage.turnId && !isNewerThan(turn, ownMessage.createdAt)) return false;
+  }
+  if (turn.state === "running") return false;
+  const assistant = turn.assistantMessageId
+    ? snapshot.thread.messages.find((m) => m.id === turn.assistantMessageId)
+    : undefined;
+  return !(assistant?.streaming ?? false);
+}
+
+const isNewerThan = (turn: { startedAt: string | null }, iso: string): boolean =>
+  turn.startedAt !== null && turn.startedAt >= iso;

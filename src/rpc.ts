@@ -4,9 +4,11 @@ import { summarizeError } from "./http.js";
 
 /**
  * Minimal client for T3's WebSocket RPC (Effect `unstable/rpc` with JSON
- * serialization). One request per `call`; streaming responses are drained via
- * `stream`, acknowledging every chunk because the server back-pressures on
- * client acks. A ping is sent every 5 seconds like the first-party client.
+ * serialization). Unary requests resolve on `Exit`; streaming requests are
+ * drained via `stream`, acknowledging every chunk on the socket that received
+ * it because the server back-pressures on client acks. A ping goes out every
+ * 5 seconds like the first-party client. All socket state is per-socket so a
+ * late `close` from an old socket can never clobber a newer one.
  */
 type Exit =
   | { _tag: "Success"; value: unknown }
@@ -16,6 +18,7 @@ type ServerMessage =
   | { _tag: "Chunk"; requestId: string | number; values: unknown[] }
   | { _tag: "Exit"; requestId: string | number; exit: Exit }
   | { _tag: "Defect"; defect: unknown }
+  | { _tag: "ClientProtocolError"; error: unknown }
   | { _tag: "Pong" };
 
 interface Pending {
@@ -27,45 +30,58 @@ interface Pending {
 export class T3RpcError extends Error {
   constructor(
     readonly tag: string,
-    readonly detail: unknown,
     message: string,
   ) {
     super(message);
   }
 }
 
+export const PAIR_HINT = "Run: t3-code-agent-mcp pair <pairing-url-or-code>";
+
 export function exitToError(exit: Extract<Exit, { _tag: "Failure" }>): T3RpcError {
   const first = exit.cause[0];
-  if (!first) return new T3RpcError("Unknown", exit, "RPC failed with an empty cause.");
+  if (!first) return new T3RpcError("Unknown", "RPC failed with an empty cause.");
   if (first._tag === "Fail") {
     const error = first.error;
     const tag =
       error && typeof error === "object" && typeof (error as { _tag?: unknown })._tag === "string"
-        ? ((error as { _tag: string })._tag as string)
+        ? (error as { _tag: string })._tag
         : "Fail";
-    return new T3RpcError(tag, error, summarizeError(error));
+    return new T3RpcError(tag, explainTaggedError(tag, summarizeError(error)));
   }
-  if (first._tag === "Interrupt") return new T3RpcError("Interrupt", first, "RPC was interrupted.");
+  if (first._tag === "Interrupt") return new T3RpcError("Interrupt", "RPC was interrupted.");
   // Schema rejections surface as defects; phrase them as a request problem, not a crash.
-  return new T3RpcError("Die", first.defect, `T3 rejected the request: ${summarizeError(first.defect)}`);
+  return new T3RpcError("Die", `T3 rejected the request: ${summarizeError(first.defect)}`);
 }
+
+/** Add the one hint an agent needs for T3's durable idempotency errors. */
+function explainTaggedError(tag: string, message: string): string {
+  if (tag === "OrchestrationCommandPreviouslyRejectedError") {
+    return `${message} This idempotencyKey was rejected before and can never be retried. Fix the cause, then call again with a new idempotencyKey.`;
+  }
+  if (tag === "EnvironmentAuthInvalidError" || tag === "EnvironmentAuthorizationError") {
+    return `${message} ${PAIR_HINT}`;
+  }
+  return message;
+}
+
+const DEFAULT_CALL_TIMEOUT_MS = 60_000;
 
 export class T3RpcClient {
   private socket: WebSocket | null = null;
+  private opening: Promise<WebSocket> | null = null;
   private readonly pending = new Map<string, Pending>();
   private nextId = 1;
-  private pingTimer: NodeJS.Timeout | null = null;
-  private opening: Promise<WebSocket> | null = null;
 
   constructor(
     private readonly origin: string,
     private readonly token: string,
   ) {}
 
-  private async connect(): Promise<WebSocket> {
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) return this.socket;
+  private connect(): Promise<WebSocket> {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) return Promise.resolve(this.socket);
     if (this.opening) return this.opening;
-    this.opening = new Promise<WebSocket>((resolve, reject) => {
+    const attempt = new Promise<WebSocket>((resolve, reject) => {
       const url = new URL("/ws", this.origin);
       url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
       url.searchParams.set("clientSurface", "web");
@@ -74,40 +90,55 @@ export class T3RpcClient {
         headers: { authorization: `Bearer ${this.token}` },
         handshakeTimeout: 10_000,
       });
+      let pingTimer: NodeJS.Timeout | null = null;
+      let rejectedWith: Error | null = null;
+      const fail = (error: Error) => {
+        if (this.opening === attempt) this.opening = null;
+        if (this.socket === socket) this.socket = null;
+        if (pingTimer) clearInterval(pingTimer);
+        pingTimer = null;
+        rejectedWith ??= error;
+        reject(error);
+        this.failAll(error);
+      };
+      socket.on("unexpected-response", (_request, response) => {
+        const status = response.statusCode ?? 0;
+        const message =
+          status === 401 || status === 403
+            ? `T3 rejected the stored token (${status}). ${PAIR_HINT}`
+            : `T3 WebSocket handshake failed (${status}).`;
+        socket.terminate();
+        fail(new Error(message));
+      });
       socket.on("open", () => {
         this.socket = socket;
-        this.opening = null;
-        this.pingTimer = setInterval(() => {
+        if (this.opening === attempt) this.opening = null;
+        pingTimer = setInterval(() => {
           if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ _tag: "Ping" }));
         }, 5000);
         resolve(socket);
       });
-      socket.on("message", (data) => this.handleMessage(data.toString()));
+      socket.on("message", (data) => this.handleMessage(socket, data.toString()));
       socket.on("error", (error) => {
-        this.opening = null;
-        reject(new Error(`T3 WebSocket error: ${error.message}`));
-        this.failAll(new Error(`T3 WebSocket error: ${error.message}`));
+        if (!rejectedWith) fail(new Error(`T3 WebSocket error: ${error.message}`));
       });
       socket.on("close", (code, reason) => {
-        this.opening = null;
-        this.socket = null;
-        if (this.pingTimer) clearInterval(this.pingTimer);
-        this.pingTimer = null;
+        if (rejectedWith) return;
         const detail = reason.toString();
-        const message = `T3 WebSocket closed (${code}${detail ? `: ${detail}` : ""})`;
-        reject(new Error(message));
-        this.failAll(new Error(message));
+        fail(new Error(`T3 WebSocket closed (${code}${detail ? `: ${detail}` : ""})`));
       });
     });
-    return this.opening;
+    this.opening = attempt;
+    return attempt;
   }
 
   private failAll(error: Error): void {
-    for (const pending of this.pending.values()) pending.reject(error);
+    const entries = Array.from(this.pending.values());
     this.pending.clear();
+    for (const pending of entries) pending.reject(error);
   }
 
-  private handleMessage(raw: string): void {
+  private handleMessage(socket: WebSocket, raw: string): void {
     let parsed: ServerMessage | ServerMessage[];
     try {
       parsed = JSON.parse(raw) as ServerMessage | ServerMessage[];
@@ -117,15 +148,18 @@ export class T3RpcClient {
     const messages = Array.isArray(parsed) ? parsed : [parsed];
     for (const message of messages) {
       if (message._tag === "Pong") continue;
-      if (message._tag === "Defect") {
-        this.failAll(new Error(`T3 RPC defect: ${summarizeError(message.defect)}`));
+      if (message._tag === "Defect" || message._tag === "ClientProtocolError") {
+        const detail = message._tag === "Defect" ? message.defect : message.error;
+        this.failAll(new Error(`T3 RPC ${message._tag}: ${summarizeError(detail)}`));
         continue;
       }
       const pending = this.pending.get(String(message.requestId));
       if (!pending) continue;
       if (message._tag === "Chunk") {
         for (const value of message.values) pending.onChunk?.(value);
-        this.socket?.send(JSON.stringify({ _tag: "Ack", requestId: message.requestId }));
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ _tag: "Ack", requestId: message.requestId }));
+        }
         continue;
       }
       this.pending.delete(String(message.requestId));
@@ -134,37 +168,62 @@ export class T3RpcClient {
     }
   }
 
-  private async send(tag: string, payload: unknown, onChunk?: (value: unknown) => void): Promise<{ id: string; done: Promise<unknown> }> {
+  private async send(
+    tag: string,
+    payload: unknown,
+    onChunk?: (value: unknown, requestId: string) => void,
+  ): Promise<{ id: string; done: Promise<unknown> }> {
     const socket = await this.connect();
     const id = String(this.nextId++);
     const done = new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { onChunk, resolve, reject });
+      try {
+        socket.send(JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] }));
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      this.pending.set(id, { onChunk: onChunk && ((value) => onChunk(value, id)), resolve, reject });
     });
-    socket.send(JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] }));
     return { id, done };
   }
 
-  /** Unary RPC: resolves with the decoded success value. */
-  async call<T>(tag: string, payload: unknown): Promise<T> {
-    const { done } = await this.send(tag, payload);
-    return (await done) as T;
+  /** Unary RPC: resolves with the decoded success value, or rejects after the timeout. */
+  async call<T>(tag: string, payload: unknown, timeoutMs = DEFAULT_CALL_TIMEOUT_MS): Promise<T> {
+    const { id, done } = await this.send(tag, payload);
+    let timer: NodeJS.Timeout | null = null;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        this.pending.delete(id);
+        this.sendInterrupt(id);
+        reject(new Error(`T3 RPC ${tag} timed out after ${Math.round(timeoutMs / 1000)}s`));
+      }, timeoutMs);
+    });
+    try {
+      return (await Promise.race([done, timeout])) as T;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
    * Streaming RPC. `onChunk` returns true to stop early, which interrupts the
-   * server-side stream. Resolves when the stream ends or is stopped.
+   * server-side stream. Resolves when the stream ends, is stopped, or the
+   * timeout passes.
    */
-  async stream(tag: string, payload: unknown, onChunk: (value: unknown) => boolean | void, timeoutMs?: number): Promise<void> {
+  async stream(
+    tag: string,
+    payload: unknown,
+    onChunk: (value: unknown) => boolean | void,
+    timeoutMs?: number,
+  ): Promise<void> {
     let stopped = false;
-    let requestId = "";
-    const { id, done } = await this.send(tag, payload, (value) => {
+    const { id, done } = await this.send(tag, payload, (value, requestId) => {
       if (stopped) return;
       if (onChunk(value) === true) {
         stopped = true;
         this.interrupt(requestId);
       }
     });
-    requestId = id;
     let timer: NodeJS.Timeout | null = null;
     const timeout =
       timeoutMs === undefined
@@ -178,28 +237,30 @@ export class T3RpcClient {
         stopped = true;
         this.interrupt(id);
       }
-    } catch (error) {
-      if (!(stopped && error instanceof T3RpcError && error.tag === "Interrupt")) throw error;
     } finally {
       if (timer) clearTimeout(timer);
     }
   }
 
+  /** Settle the local stream promise immediately and tell the server to stop. */
   private interrupt(requestId: string): void {
     const pending = this.pending.get(requestId);
     if (pending) {
       this.pending.delete(requestId);
       pending.resolve(undefined);
     }
+    this.sendInterrupt(requestId);
+  }
+
+  private sendInterrupt(requestId: string): void {
     if (this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ _tag: "Interrupt", requestId }));
     }
   }
 
   close(): void {
-    if (this.pingTimer) clearInterval(this.pingTimer);
-    this.pingTimer = null;
-    this.socket?.close();
+    const socket = this.socket;
     this.socket = null;
+    socket?.close();
   }
 }
