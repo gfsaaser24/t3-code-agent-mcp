@@ -208,8 +208,9 @@ export class T3RpcClient {
     let timer: NodeJS.Timeout | null = null;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        const pending = this.pending.get(id);
         this.pending.delete(id);
-        this.sendInterrupt(id);
+        if (pending) this.sendInterrupt(pending.socket, id);
         reject(new Error(`T3 RPC ${tag} timed out after ${Math.round(timeoutMs / 1000)}s`));
       }, timeoutMs);
     });
@@ -260,16 +261,16 @@ export class T3RpcClient {
   /** Settle the local stream promise immediately and tell the server to stop. */
   private interrupt(requestId: string): void {
     const pending = this.pending.get(requestId);
-    if (pending) {
-      this.pending.delete(requestId);
-      pending.resolve(undefined);
-    }
-    this.sendInterrupt(requestId);
+    if (!pending) return;
+    this.pending.delete(requestId);
+    pending.resolve(undefined);
+    this.sendInterrupt(pending.socket, requestId);
   }
 
-  private sendInterrupt(requestId: string): void {
-    if (this.socket?.readyState === WebSocket.OPEN) {
-      this.socket.send(JSON.stringify({ _tag: "Interrupt", requestId }));
+  /** Interrupts must travel on the socket that carried the request; request ids are per socket on the server. */
+  private sendInterrupt(socket: WebSocket, requestId: string): void {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ _tag: "Interrupt", requestId }));
     }
   }
 

@@ -177,6 +177,25 @@ describe("T3RpcClient", () => {
     expect(Array.from(wss.clients).filter((c) => c.readyState === c.OPEN)).toHaveLength(0);
   });
 
+  it("sends a timeout interrupt on the socket that carried the request, not a newer one", async () => {
+    const client = new T3RpcClient(origin, "secret");
+    const slow = client.call("silent", {}, 150);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const socketA = Array.from(wss.clients)[0]!;
+    const interruptOnA = new Promise<void>((resolve) =>
+      socketA.on("message", (data) => {
+        if (JSON.parse(data.toString())._tag === "Interrupt") resolve();
+      }),
+    );
+    // Force a reconnect so a newer socket B becomes current while A's request is still pending.
+    (client as unknown as { socket: WebSocket | null }).socket = null;
+    await client.call("echo", {});
+    expect(wss.clients.size).toBe(2);
+    await expect(slow).rejects.toThrow(/timed out/);
+    await expect(Promise.race([interruptOnA, new Promise((_, reject) => setTimeout(() => reject(new Error("no Interrupt on A")), 500))])).resolves.toBeUndefined();
+    client.close();
+  });
+
   it("a stale socket's failure does not reject requests on the new socket", async () => {
     const client = new T3RpcClient(origin, "secret");
     await client.call("echo", {});
