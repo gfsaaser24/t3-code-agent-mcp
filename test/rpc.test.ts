@@ -166,4 +166,26 @@ describe("T3RpcClient", () => {
     const client = new T3RpcClient(origin, "stale");
     await expect(client.call("echo", {})).rejects.toThrow(/rejected the stored token \(401\).*pair/);
   });
+
+  it("close() during the handshake terminates the connecting socket and rejects later calls", async () => {
+    const client = new T3RpcClient(origin, "secret");
+    const pending = client.call("echo", {});
+    client.close();
+    await expect(pending).rejects.toThrow(/closed/);
+    await expect(client.call("echo", {})).rejects.toThrow(/closed/);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(Array.from(wss.clients).filter((c) => c.readyState === c.OPEN)).toHaveLength(0);
+  });
+
+  it("a stale socket's failure does not reject requests on the new socket", async () => {
+    const client = new T3RpcClient(origin, "secret");
+    await client.call("echo", {});
+    const stale = Array.from(wss.clients)[0]!;
+    // Pause the server's close so the old socket is still CLOSING while a new call connects.
+    const dropped = client.call("drop", {});
+    await expect(dropped).rejects.toThrow(/closed/);
+    const next = client.call("echo", { fresh: true });
+    stale.emit("close");
+    expect(await next).toEqual({ fresh: true });
+  });
 });

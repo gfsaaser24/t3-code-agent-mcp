@@ -21,14 +21,23 @@ export function makeHttpClient(origin: string, token: string, fetchImpl: typeof 
         const reason = error instanceof Error && error.name === "TimeoutError" ? "timed out after 30s" : summarizeError(error);
         throw new Error(`T3 GET ${url.pathname} ${reason}`);
       }
-      const text = await response.text();
       if (response.status === 401 || response.status === 403) {
         throw new Error(`T3 rejected the stored token (${response.status}). ${PAIR_HINT}`);
+      }
+      let text: string;
+      try {
+        text = await response.text();
+      } catch (error) {
+        throw new Error(`T3 GET ${url.pathname} body read failed: ${summarizeError(error)}`);
       }
       if (!response.ok) {
         throw new Error(`T3 GET ${url.pathname} failed (${response.status}): ${summarizeError(text)}`);
       }
-      return JSON.parse(text) as T;
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        throw new Error(`T3 GET ${url.pathname} returned invalid JSON: ${text.slice(0, 120)}`);
+      }
     },
   };
 }

@@ -22,6 +22,7 @@ type ServerMessage =
   | { _tag: "Pong" };
 
 interface Pending {
+  socket: WebSocket;
   onChunk?: (value: unknown) => void;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -69,7 +70,9 @@ const DEFAULT_CALL_TIMEOUT_MS = 60_000;
 
 export class T3RpcClient {
   private socket: WebSocket | null = null;
+  private connecting: WebSocket | null = null;
   private opening: Promise<WebSocket> | null = null;
+  private closed = false;
   private readonly pending = new Map<string, Pending>();
   private nextId = 1;
 
@@ -79,6 +82,7 @@ export class T3RpcClient {
   ) {}
 
   private connect(): Promise<WebSocket> {
+    if (this.closed) return Promise.reject(new Error("T3 RPC client is closed."));
     if (this.socket && this.socket.readyState === WebSocket.OPEN) return Promise.resolve(this.socket);
     if (this.opening) return this.opening;
     const attempt = new Promise<WebSocket>((resolve, reject) => {
@@ -90,16 +94,18 @@ export class T3RpcClient {
         headers: { authorization: `Bearer ${this.token}` },
         handshakeTimeout: 10_000,
       });
+      this.connecting = socket;
       let pingTimer: NodeJS.Timeout | null = null;
       let rejectedWith: Error | null = null;
       const fail = (error: Error) => {
         if (this.opening === attempt) this.opening = null;
+        if (this.connecting === socket) this.connecting = null;
         if (this.socket === socket) this.socket = null;
         if (pingTimer) clearInterval(pingTimer);
         pingTimer = null;
         rejectedWith ??= error;
         reject(error);
-        this.failAll(error);
+        this.failSocket(socket, error);
       };
       socket.on("unexpected-response", (_request, response) => {
         const status = response.statusCode ?? 0;
@@ -111,7 +117,13 @@ export class T3RpcClient {
         fail(new Error(message));
       });
       socket.on("open", () => {
+        if (this.closed) {
+          socket.terminate();
+          fail(new Error("T3 RPC client is closed."));
+          return;
+        }
         this.socket = socket;
+        if (this.connecting === socket) this.connecting = null;
         if (this.opening === attempt) this.opening = null;
         pingTimer = setInterval(() => {
           if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ _tag: "Ping" }));
@@ -132,10 +144,13 @@ export class T3RpcClient {
     return attempt;
   }
 
-  private failAll(error: Error): void {
-    const entries = Array.from(this.pending.values());
-    this.pending.clear();
-    for (const pending of entries) pending.reject(error);
+  /** Reject only the requests that were sent on this socket; a newer socket's requests are untouched. */
+  private failSocket(socket: WebSocket, error: Error): void {
+    for (const [id, pending] of Array.from(this.pending.entries())) {
+      if (pending.socket !== socket) continue;
+      this.pending.delete(id);
+      pending.reject(error);
+    }
   }
 
   private handleMessage(socket: WebSocket, raw: string): void {
@@ -150,11 +165,11 @@ export class T3RpcClient {
       if (message._tag === "Pong") continue;
       if (message._tag === "Defect" || message._tag === "ClientProtocolError") {
         const detail = message._tag === "Defect" ? message.defect : message.error;
-        this.failAll(new Error(`T3 RPC ${message._tag}: ${summarizeError(detail)}`));
+        this.failSocket(socket, new Error(`T3 RPC ${message._tag}: ${summarizeError(detail)}`));
         continue;
       }
       const pending = this.pending.get(String(message.requestId));
-      if (!pending) continue;
+      if (!pending || pending.socket !== socket) continue;
       if (message._tag === "Chunk") {
         for (const value of message.values) pending.onChunk?.(value);
         if (socket.readyState === WebSocket.OPEN) {
@@ -182,7 +197,7 @@ export class T3RpcClient {
         reject(error instanceof Error ? error : new Error(String(error)));
         return;
       }
-      this.pending.set(id, { onChunk: onChunk && ((value) => onChunk(value, id)), resolve, reject });
+      this.pending.set(id, { socket, onChunk: onChunk && ((value) => onChunk(value, id)), resolve, reject });
     });
     return { id, done };
   }
@@ -258,9 +273,14 @@ export class T3RpcClient {
     }
   }
 
+  /** Stop everything, including a handshake still in flight. Further calls reject. */
   close(): void {
+    this.closed = true;
     const socket = this.socket;
+    const connecting = this.connecting;
     this.socket = null;
+    this.connecting = null;
     socket?.close();
+    connecting?.terminate();
   }
 }

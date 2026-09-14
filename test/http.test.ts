@@ -35,4 +35,19 @@ describe("makeHttpClient", () => {
     });
     await expect(timeout.get("/api/z")).rejects.toThrow("T3 GET /api/z timed out after 30s");
   });
+
+  it("names the path when the body read or JSON parse fails", async () => {
+    const badBody = makeHttpClient("http://h", "tok", async () => {
+      const response = new Response("", { status: 200 });
+      Object.defineProperty(response, "text", {
+        value: async () => {
+          throw new Error("socket hang up");
+        },
+      });
+      return response;
+    });
+    await expect(badBody.get("/api/b")).rejects.toThrow("T3 GET /api/b body read failed: socket hang up");
+    const badJson = makeHttpClient("http://h", "tok", async () => new Response("<html>", { status: 200 }));
+    await expect(badJson.get("/api/j")).rejects.toThrow("T3 GET /api/j returned invalid JSON: <html>");
+  });
 });
