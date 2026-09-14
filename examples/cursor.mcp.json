@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "t3": {
+      "command": "node",
+      "args": ["/path/to/t3-code-agent-mcp/dist/cli.js"]
+    }
+  }
+}

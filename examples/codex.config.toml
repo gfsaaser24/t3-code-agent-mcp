@@ -1,0 +1,8 @@
+# Append to ~/.codex/config.toml
+[mcp_servers.t3]
+command = "node"
+args = ["/path/to/t3-code-agent-mcp/dist/cli.js"]
+
+# Optional: only if your T3 data directory is not ~/.t3
+[mcp_servers.t3.env]
+T3CODE_HOME = "/path/to/.t3"
