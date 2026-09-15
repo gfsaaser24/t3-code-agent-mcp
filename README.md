@@ -207,7 +207,7 @@ Returns the thread summary plus `reused` (true when the key matched an existing 
 | `idempotencyKey` | Stable key; retries do not start a second turn |
 | `wait`, `timeoutSeconds` | As above |
 
-Refuses if a *different* turn is still running so an in-flight turn is never clobbered. A retry with the same key is always safe.
+Works while a turn is running. T3 passes the message to the harness mid-turn (steering), the same way the T3 UI does. A retry with the same key is always safe. Use `t3_cancel_turn` first if you want a clean stop instead of steering.
 
 ### `t3_get_thread`
 
@@ -283,7 +283,6 @@ Forks that keep these surfaces work unchanged; a fork that moves its data direct
 | `No T3 token for …` / `rejected the stored token (401)` | Create a pairing link in T3 → Settings → Connections and run `node dist/cli.js pair …` |
 | `harness "…" is not usable right now` | Install, enable, or sign in to that harness inside T3; check `t3_list_harnesses {includeUnusable: true}` for the reason |
 | `model "…" is not offered by harness "…"` | Use a slug or alias from `t3_list_harnesses`; nothing is substituted on purpose |
-| `already has a running turn` | Wait with `t3_wait_for_turn` or stop it with `t3_cancel_turn` |
 | `This idempotencyKey was rejected before` | The command failed once and T3 remembers it; fix the cause and use a new key |
 | `T3 thread snapshot is missing …` | Your T3 is newer than this server's contract mirror; update t3-code-agent-mcp |
 

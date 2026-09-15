@@ -154,18 +154,23 @@ describe("t3_create_thread", () => {
 });
 
 describe("t3_send_message", () => {
-  it("refuses a different running turn but lets a retry of an already-sent message through", async () => {
+  it("sends mid-turn (steering) while a turn is running, and a retry of an already-sent message does not dispatch again", async () => {
     const running = { turnId: "R", state: "running", startedAt: "", completedAt: null, assistantMessageId: null };
     const ids = commandIds("t1", "step");
+    const dispatched: string[] = [];
     const call = harness({
       thread: async () => detail(threadShell("t1", running), [{ id: ids.messageId, role: "user", text: "x", turnId: "R", streaming: false, createdAt: "" }]),
-      startTurn: async () => {
-        throw new Error("must not dispatch");
+      startTurn: async (spec) => {
+        dispatched.push(spec.messageId);
       },
     });
-    expect((await call("t3_send_message", { threadId: "t1", prompt: "p", idempotencyKey: "other" })).error).toMatch(/already has a running turn/);
+    const steer = await call("t3_send_message", { threadId: "t1", prompt: "p", idempotencyKey: "other" });
+    expect(steer.error).toBeUndefined();
+    expect(steer.reused).toBe(false);
+    expect(dispatched).toEqual([commandIds("t1", "other").messageId]);
     const retry = await call("t3_send_message", { threadId: "t1", prompt: "p", idempotencyKey: "step" });
     expect(retry.reused).toBe(true);
+    expect(dispatched).toHaveLength(1);
   });
 });
 

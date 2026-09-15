@@ -326,7 +326,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Send a follow-up prompt",
       description:
-        "Send another user message to an existing T3 thread, starting a new turn with the thread's current harness and model. Refuses (client-side policy, so an in-flight turn is not clobbered) if a different turn is still running; a retry with the same idempotencyKey is always safe.",
+        "Send another user message to an existing T3 thread with the thread's current harness and model. Works while a turn is running: T3 hands the message to the harness mid-turn (steering), exactly as the T3 UI does. A retry with the same idempotencyKey is always safe.",
       inputSchema: {
         threadId: z.string(),
         prompt: z.string().min(1),
@@ -342,11 +342,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const before = await api.thread(input.threadId);
       const ids = commandIds(input.threadId, input.idempotencyKey);
       const alreadySent = before.thread.messages.some((m) => m.id === ids.messageId);
-      if (!alreadySent && before.thread.latestTurn?.state === "running") {
-        throw new Error(
-          `Thread ${input.threadId} already has a running turn (${before.thread.latestTurn.turnId}). Wait for it or cancel it first.`,
-        );
-      }
+      // No "turn is running" guard on purpose: T3 accepts thread.turn.start
+      // mid-turn and forwards it to the harness as steering, same as the UI.
       if (!alreadySent) {
         // Safe even if the message landed after our read: T3 replays the
         // accepted receipt for a repeated commandId instead of starting again.
