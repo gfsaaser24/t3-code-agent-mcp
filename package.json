@@ -9,6 +9,8 @@
   },
   "files": [
     "dist",
+    "examples/orchestrator-prompt.md",
+    "examples/orchestrator-prompt-standard.md",
     "README.md"
   ],
   "scripts": {

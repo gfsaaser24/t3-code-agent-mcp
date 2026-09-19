@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import { commandIds } from "./ids.js";
+import { registerOrchestrationPromptTool } from "./prompts.js";
 import { normalizePath, resolveExistingWorktree, resolveHarness, resolveModel, resolveProject, unusableReason } from "./resolve.js";
 import type { T3Api } from "./t3.js";
 import type { Message, ThreadDetailSnapshot, ThreadShell } from "./types.js";
@@ -109,6 +110,8 @@ function tool<Shape extends ZodRawShapeCompat>(
 
 export function registerTools(server: McpServer, ctx: ToolContext): void {
   const { api } = ctx;
+
+  registerOrchestrationPromptTool(server);
 
   tool(
     server,

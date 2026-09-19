@@ -30,6 +30,7 @@ Use it when an agent in one thread needs to kick off more work: "open a Codex th
 
 | Tool | What it does |
 | --- | --- |
+| `t3_get_orchestration_prompt` | Recall a copyable orchestrator prompt, with or without TypeSafe/Jev |
 | `t3_list_projects` | Projects the T3 server knows, with ids and workspace roots |
 | `t3_list_worktrees` | Git worktrees and local branches of one project |
 | `t3_list_harnesses` | Harnesses (Codex, Claude, Cursor, Grok, OpenCode, …) and the models each offers, with a usable flag and reason |
@@ -147,6 +148,23 @@ t3_cancel_turn     {threadId}                      → stop a running turn
 Every thread result includes `url`, which opens the thread in the T3 web UI, and `turn.state` (`running`, `completed`, `interrupted`, `error`).
 
 ## Tool reference
+
+### `t3_get_orchestration_prompt`
+
+Ask your agent **"Show me the orchestration prompt"** or **"Show me the orchestration prompt with TypeSafe"**. The agent can call:
+
+```text
+t3_get_orchestration_prompt({})                       // standard, without TypeSafe
+t3_get_orchestration_prompt({variant: "typesafe"})    // with TypeSafe / Jev
+```
+
+| Input | Notes |
+| --- | --- |
+| `variant` | `standard` (default) or `typesafe` |
+
+Returns the complete saved prompt as a fenced Markdown text block, ready for the agent to display inline in chat. The host client controls rendering and copy-button support. Retrieval only reads a bundled file; it does not launch threads, call T3 APIs, or invoke TypeSafe. The MCP server still uses its normal T3 connection at startup.
+
+Both versions cover up to five workers, separate worktrees and PRs, labeled MCP communication, batched review fixes, dependency order, and lightweight checks without waiting for CI. The TypeSafe version adds optional Jev tool guidance. The editable templates are [standard](examples/orchestrator-prompt-standard.md) and [with TypeSafe](examples/orchestrator-prompt.md); both ship in the npm package.
 
 ### `t3_list_projects`
 
