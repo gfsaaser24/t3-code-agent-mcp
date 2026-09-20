@@ -36,8 +36,9 @@ describe("t3_get_orchestration_prompt", () => {
       const saved = (await readFile(new URL(`../examples/${file}`, import.meta.url), "utf8")).trim();
       expect(result.isError).not.toBe(true);
       expect(result.content).toEqual([{ type: "text", text: `Orchestration prompt — ${title}\n\n\`\`\`text\n${saved}\n\`\`\`` }]);
-      expect(saved).toContain("FIVE concurrent worker threads");
-      expect(saved).toContain("READY_TO_MERGE");
+      expect(saved).toContain("FIVE concurrent workers");
+      expect(saved).toContain("REVIEW_READY");
+      expect(saved).toContain("ROLE=WORKER");
       expect(/typesafe|jev_/i.test(saved)).toBe(typesafe);
     });
   });

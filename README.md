@@ -164,7 +164,7 @@ t3_get_orchestration_prompt({variant: "typesafe"})    // with TypeSafe / Jev
 
 Returns the complete saved prompt as a fenced Markdown text block, ready for the agent to display inline in chat. The host client controls rendering and copy-button support. Retrieval only reads a bundled file; it does not launch threads, call T3 APIs, or invoke TypeSafe. The MCP server still uses its normal T3 connection at startup.
 
-Both versions cover up to five workers, separate worktrees and PRs, labeled MCP communication, batched review fixes, dependency order, and lightweight checks without waiting for CI. The TypeSafe version adds optional Jev tool guidance. The editable templates are [standard](examples/orchestrator-prompt-standard.md) and [with TypeSafe](examples/orchestrator-prompt.md); both ship in the npm package.
+Both versions are general purpose: up to five workers, a task brief with acceptance IDs, ownership by coupling, an acceptance ledger, proportional verification, early integration, one review queue with batched fixes, and labeled MCP communication. The TypeSafe version adds one optional Jev section. The editable templates are [standard](examples/orchestrator-prompt-standard.md) and [with TypeSafe](examples/orchestrator-prompt.md); both ship in the npm package.
 
 For the optional TypeSafe tools, install [Jev MCP](https://github.com/burnigtm/jev-mcp). Its README includes setup instructions and the bundled coding skill for patch review, edge-case assessment, and checking claims against evidence.
 
