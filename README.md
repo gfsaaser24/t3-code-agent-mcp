@@ -1,16 +1,105 @@
+<div align="center">
+
 # t3-code-agent-mcp
 
-A small, local [MCP](https://modelcontextprotocol.io) server that lets a coding agent (Claude Code, Codex CLI, Cursor, or any MCP client) start and drive threads in your running **[T3 Code](https://github.com/pingdotgg/t3code)** app.
+**Let one coding agent start, steer, and read other agents inside your running [T3 Code](https://github.com/pingdotgg/t3code) app.**
+
+[![Version](https://img.shields.io/badge/version-0.2.0-blue?style=flat-square)](#changelog)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen?style=flat-square&logo=node.js&logoColor=white)](package.json)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&logo=typescript&logoColor=white)](tsconfig.json)
+[![MCP](https://img.shields.io/badge/MCP-stdio-black?style=flat-square)](https://modelcontextprotocol.io)
+[![Tests](https://img.shields.io/badge/tests-vitest-6E9F18?style=flat-square&logo=vitest&logoColor=white)](test/)
+[![T3 Code](https://img.shields.io/badge/T3%20Code-server%200.0.40-orange?style=flat-square)](#compatibility)
+
+[Install](#install) · [Pair](#pair-with-t3) · [Configure](#configure-your-mcp-client) · [Tools](#tool-reference) · [How it works](#how-it-works) · [Changelog](#changelog)
+
+</div>
+
+---
+
+A small, local [MCP](https://modelcontextprotocol.io) server. Any MCP client (Claude Code, Codex CLI, Cursor, …) can use it to open threads in T3 Code, send prompts, wait for replies, steer a running turn, or cancel it.
 
 Use it when an agent in one thread needs to kick off more work: "open a Codex thread on this repo with `gpt-5.6-sol` and ask it to fix the flaky test", then read the reply, send follow-ups, or cancel.
 
-- Talks to T3 the same way the T3 web app does: T3's own HTTP + WebSocket interfaces, T3's own pairing tokens. T3 handles each harness's protocol.
-- Threads show up in the normal T3 UI, with a link back to them.
-- Never opens or writes T3's database.
-- Runs over stdio on your machine. No cloud, no extra ports.
+- 🔌 Talks to T3 the same way the T3 web app does: T3's own HTTP + WebSocket interfaces, T3's own pairing tokens. T3 handles each harness's protocol.
+- 👀 Threads show up in the normal T3 UI, with a link back to them.
+- 🔒 Never opens or writes T3's database.
+- 💻 Runs over stdio on your machine. No cloud, no extra ports.
+- 🧠 Ships a copyable orchestrator prompt for fan-out work across up to five workers.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Client["Your MCP client"]
+        A[Claude Code / Codex CLI / Cursor]
+    end
+
+    subgraph MCP["t3-code-agent-mcp (this repo)"]
+        direction TB
+        T[MCP tools<br/>src/tools.ts]
+        R[Strict resolve<br/>project · harness · model · worktree]
+        I[Idempotency<br/>key → deterministic ids]
+        H[HTTP reads<br/>src/http.ts]
+        W[WebSocket RPC<br/>src/rpc.ts]
+        T --> R --> I
+        I --> H
+        I --> W
+    end
+
+    subgraph T3["Running T3 Code server"]
+        direction TB
+        S["/api/orchestration/*"]
+        K["/ws  orchestration.dispatchCommand<br/>server.getConfig · vcs.listRefs"]
+        U[T3 web UI]
+        S --- U
+        K --- U
+    end
+
+    subgraph Harness["Harnesses (managed by T3)"]
+        C1[Codex]
+        C2[Claude]
+        C3[Cursor · Grok · OpenCode …]
+    end
+
+    A <-- "stdio" --> T
+    H <-- "GET + Bearer" --> S
+    W <-- "Effect RPC + Bearer" --> K
+    K --> C1
+    K --> C2
+    K --> C3
+```
+
+<details>
+<summary><b>What a single <code>t3_create_thread</code> call does</b></summary>
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Agent as MCP client
+    participant MCP as t3-code-agent-mcp
+    participant T3 as T3 server
+    participant H as Harness
+
+    Agent->>MCP: t3_create_thread {project, harness, model, prompt, idempotencyKey, wait:true}
+    MCP->>T3: GET /api/orchestration/shell (projects)
+    MCP->>T3: RPC server.getConfig (harnesses + models)
+    Note over MCP: Resolve strictly. Unknown harness/model → error with valid options.
+    MCP->>T3: RPC orchestration.subscribeThread
+    MCP->>T3: RPC orchestration.dispatchCommand thread.turn.start + bootstrap.createThread
+    T3->>H: start turn
+    H-->>T3: assistant messages
+    T3-->>MCP: session / settle events
+    MCP->>T3: GET /api/orchestration/threads/:id
+    MCP-->>Agent: {threadId, url, turn.state, reply}
+```
+
+</details>
 
 ## Contents
 
+- [Architecture](#architecture)
 - [Tools](#tools)
 - [Guarantees](#guarantees)
 - [Requirements](#requirements)
@@ -24,6 +113,8 @@ Use it when an agent in one thread needs to kick off more work: "open a Codex th
 - [Compatibility](#compatibility)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
+- [Contributing](#contributing)
+- [Changelog](#changelog)
 - [Security](#security)
 
 ## Tools
@@ -94,7 +185,8 @@ Headless alternative: set `T3_ACCESS_TOKEN` to a token from `t3 auth session iss
 
 Replace `/path/to/t3-code-agent-mcp` with where you cloned it. Ready-made files are in [`examples/`](examples/).
 
-### Claude Code
+<details open>
+<summary><b>Claude Code</b></summary>
 
 ```bash
 claude mcp add --scope user t3 -- node /path/to/t3-code-agent-mcp/dist/cli.js
@@ -110,7 +202,10 @@ or in `.mcp.json` / `~/.claude.json`:
 }
 ```
 
-### Codex CLI (`~/.codex/config.toml`)
+</details>
+
+<details>
+<summary><b>Codex CLI</b> (<code>~/.codex/config.toml</code>)</summary>
 
 ```toml
 [mcp_servers.t3]
@@ -118,7 +213,10 @@ command = "node"
 args = ["/path/to/t3-code-agent-mcp/dist/cli.js"]
 ```
 
-### Cursor (`.cursor/mcp.json`)
+</details>
+
+<details>
+<summary><b>Cursor</b> (<code>.cursor/mcp.json</code>)</summary>
 
 ```json
 {
@@ -128,9 +226,14 @@ args = ["/path/to/t3-code-agent-mcp/dist/cli.js"]
 }
 ```
 
-### Any other MCP client
+</details>
+
+<details>
+<summary><b>Any other MCP client</b></summary>
 
 Command `node`, argument `/path/to/t3-code-agent-mcp/dist/cli.js`, transport stdio. Optional environment variables are listed below.
+
+</details>
 
 ## Typical agent flow
 
@@ -333,7 +436,44 @@ src/resolve.ts      strict project / harness / model / worktree lookup
 src/ids.ts          idempotency-key → deterministic ids
 src/tools.ts        MCP tool definitions
 src/types.ts        wire shapes mirrored from T3's contracts
+src/prompts.ts      t3_get_orchestration_prompt (reads examples/)
 ```
+
+## Contributing
+
+Before you push, follow [`docs/RELEASE-CHECKLIST.md`](docs/RELEASE-CHECKLIST.md). It lists what to bump, which README sections to update, and the checks to run. Short version:
+
+1. Bump `version` in `package.json` and `package-lock.json` ([SemVer](https://semver.org)).
+2. Add an entry at the top of [Changelog](#changelog).
+3. Update the tool docs above if a tool, input, env var, or prompt changed.
+4. `npm run typecheck && npm test && npm run build` must be green.
+5. Commit with a [Conventional Commit](https://www.conventionalcommits.org) message and tag the release.
+
+## Changelog
+
+All notable changes to this project are listed here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
+
+### v0.2.0 — 2026-09-20
+
+**Added**
+- `t3_get_orchestration_prompt` tool with `standard` and `typesafe` variants. Returns a copyable orchestrator prompt without touching T3.
+- General-purpose orchestration prompts: task brief with acceptance IDs, ownership by coupling, acceptance ledger, proportional verification, early integration, one review queue, worker assignment template. The `typesafe` variant adds an optional [Jev MCP](https://github.com/burnigtm/jev-mcp) section.
+- `t3_send_message` now works while a turn is running. T3 passes the message to the harness mid-turn (steering).
+- README: badges, architecture and sequence diagrams, collapsible client configs, Contributing and Changelog sections.
+- `docs/RELEASE-CHECKLIST.md`: what to update before every push.
+
+**Changed**
+- Prompt templates rewritten from a GitHub-specific worker/PR loop to a provider-agnostic, general-purpose orchestration workflow. Worker states are now `LOCAL_READY` / `REVIEW_READY` instead of `READY_TO_MERGE`.
+
+### v0.1.0 — 2026-09-14
+
+**Added**
+- Initial release. Local stdio MCP server that drives T3 Code threads through T3's own HTTP + WebSocket interfaces.
+- Tools: `t3_list_projects`, `t3_list_worktrees`, `t3_list_harnesses`, `t3_list_threads`, `t3_create_thread`, `t3_send_message`, `t3_get_thread`, `t3_wait_for_turn`, `t3_cancel_turn`.
+- CLI: `serve`, `pair`, `status`. Pairing-code exchange for a 30-day bearer token stored in `~/.t3-code-agent-mcp/credentials.json`.
+- Strict project / harness / model / worktree resolution with no silent substitution.
+- Idempotency keys mapped to deterministic thread, command, and message ids so retries never launch twice.
+- Runtime checks on the T3 response fields the wait loop depends on.
 
 ## Security
 

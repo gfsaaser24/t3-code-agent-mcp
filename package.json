@@ -1,6 +1,6 @@
 {
   "name": "t3-code-agent-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local MCP server (stdio) that lets coding agents start and drive T3 Code threads through the running T3 server.",
   "type": "module",
   "license": "MIT",
