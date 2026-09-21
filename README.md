@@ -16,6 +16,34 @@
 
 </div>
 
+```mermaid
+flowchart TB
+    O["🧠 Orchestrator agent<br/><i>Claude Code · Codex CLI · Cursor · any MCP client</i>"]
+
+    O -- "stdio" --> M["🔌 t3-code-agent-mcp<br/><code>t3_create_thread</code> · <code>t3_send_message</code> · <code>t3_get_thread</code><br/><code>t3_wait_for_turn</code> · <code>t3_cancel_turn</code>"]
+
+    M -- "HTTP + WebSocket<br/>Bearer token" --> T["🖥️ T3 Code server<br/>projects · worktrees · threads · harness config"]
+
+    T --> W1["Thread J01<br/>🟢 <b>Codex</b> harness<br/>worktree <code>feat/contracts</code>"]
+    T --> W2["Thread J02<br/>🟠 <b>Claude</b> harness<br/>worktree <code>feat/ui</code>"]
+    T --> W3["Thread J03<br/>🔵 <b>Cursor / Grok / OpenCode</b><br/>worktree <code>feat/tests</code>"]
+
+    W1 -. "reply · findings<br/>(t3_send_message, wait:false)" .-> O
+    W2 -. "reply · findings" .-> O
+    W3 -. "reply · findings" .-> O
+
+    T --- UI["👀 T3 web UI<br/>every thread visible, linkable"]
+
+    classDef orch fill:#1f2937,color:#fff,stroke:#111
+    classDef mcp fill:#2563eb,color:#fff,stroke:#1e3a8a
+    classDef t3 fill:#ea580c,color:#fff,stroke:#9a3412
+    classDef worker fill:#f3f4f6,color:#111,stroke:#9ca3af
+    class O orch
+    class M mcp
+    class T t3
+    class W1,W2,W3,UI worker
+```
+
 ---
 
 A small, local [MCP](https://modelcontextprotocol.io) server. Any MCP client (Claude Code, Codex CLI, Cursor, …) can use it to open threads in T3 Code, send prompts, wait for replies, steer a running turn, or cancel it.
@@ -459,7 +487,7 @@ All notable changes to this project are listed here. Format follows [Keep a Chan
 - `t3_get_orchestration_prompt` tool with `standard` and `typesafe` variants. Returns a copyable orchestrator prompt without touching T3.
 - General-purpose orchestration prompts: task brief with acceptance IDs, ownership by coupling, acceptance ledger, proportional verification, early integration, one review queue, worker assignment template. The `typesafe` variant adds an optional [Jev MCP](https://github.com/burnigtm/jev-mcp) section.
 - `t3_send_message` now works while a turn is running. T3 passes the message to the harness mid-turn (steering).
-- README: badges, architecture and sequence diagrams, collapsible client configs, Contributing and Changelog sections.
+- README: badges, harness fan-out diagram, architecture and sequence diagrams, collapsible client configs, Contributing and Changelog sections.
 - `docs/RELEASE-CHECKLIST.md`: what to update before every push.
 
 **Changed**
