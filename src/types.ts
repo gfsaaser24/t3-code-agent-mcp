@@ -5,10 +5,16 @@
  * fields we branch on are checked at runtime in `assertThreadShape`.
  */
 
+/** T3 model options travel as a list of `{id, value}` pairs, not an object map. */
+export interface ModelSelectionOption {
+  id: string;
+  value: string | number | boolean;
+}
+
 export interface ModelSelection {
   instanceId: string;
   model: string;
-  options?: Record<string, unknown>;
+  options?: ModelSelectionOption[];
 }
 
 export type RuntimeMode = "approval-required" | "auto-accept-edits" | "auto" | "full-access";

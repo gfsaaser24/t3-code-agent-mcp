@@ -4,7 +4,7 @@
 
 **Let one coding agent start, steer, and read other agents inside your running [T3 Code](https://github.com/pingdotgg/t3code) app.**
 
-[![Version](https://img.shields.io/badge/version-0.2.0-blue?style=flat-square)](#changelog)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue?style=flat-square)](#changelog)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen?style=flat-square&logo=node.js&logoColor=white)](package.json)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&logo=typescript&logoColor=white)](tsconfig.json)
@@ -339,6 +339,7 @@ Returns `[{ harnessId, driver, displayName, usable, reason, status, auth, versio
 | `context` | Optional `[{ label?, text }]` blocks appended below the prompt |
 | `worktreePath` | Existing worktree from `t3_list_worktrees`, or the project root (default) |
 | `newWorktree` | `{ baseBranch, branch?, runSetupScript? }`: ask T3 to create a fresh worktree. Mutually exclusive with `worktreePath` |
+| `effort` | Optional reasoning effort (e.g. `low`, `medium`, `high`, `xhigh`). Sent as `effort` for Claude, `reasoningEffort` for Codex and `reasoning` for Cursor; other harnesses are rejected. Check the thread's `options` in the result |
 | `runtimeMode` | `approval-required`, `auto-accept-edits`, `auto`, `full-access` (default) |
 | `interactionMode` | `default` or `plan` |
 | `idempotencyKey` | Stable key; retries reuse the same thread |
@@ -354,6 +355,7 @@ Returns the thread summary plus `reused` (true when the key matched an existing 
 | `threadId` | |
 | `prompt` | |
 | `context` | Optional blocks as above |
+| `effort` | Optional; changes the thread's reasoning effort from this turn on. Same rules as `t3_create_thread` |
 | `runtimeMode`, `interactionMode` | Default: the thread's current modes |
 | `idempotencyKey` | Stable key; retries do not start a second turn |
 | `wait`, `timeoutSeconds` | As above |
@@ -480,6 +482,15 @@ Before you push, follow [`docs/RELEASE-CHECKLIST.md`](docs/RELEASE-CHECKLIST.md)
 ## Changelog
 
 All notable changes to this project are listed here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [SemVer](https://semver.org).
+
+### v0.3.0 — 2026-10-03
+
+**Added**
+- `effort` input on `t3_create_thread` and `t3_send_message`. Maps to `effort` (Claude), `reasoningEffort` (Codex) or `reasoning` (Cursor); other harnesses are rejected instead of silently dropping the value.
+- Thread results now include `options`, the thread's current model options, so the setting can be read back.
+
+**Fixed**
+- Model options are sent in T3's `[{ id, value }]` list shape. `ModelSelection.options` was typed as an object map, which T3 does not accept.
 
 ### v0.2.0 — 2026-09-20
 

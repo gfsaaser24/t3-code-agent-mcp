@@ -1,4 +1,4 @@
-import type { ProjectShell, Provider, ProviderModel, VcsRef } from "./types.js";
+import type { ModelSelectionOption, ProjectShell, Provider, ProviderModel, VcsRef } from "./types.js";
 
 /**
  * Strict lookups. Every resolver either returns the exact match the caller
@@ -69,6 +69,32 @@ export function resolveModel(provider: Provider, ref: string): ProviderModel {
       .map((m) => m.slug)
       .join(", ")}`,
   );
+}
+
+/** Option id each driver reads its reasoning effort from. */
+const EFFORT_OPTION_ID: Record<string, string> = {
+  claudeAgent: "effort",
+  codex: "reasoningEffort",
+  cursor: "reasoning",
+};
+
+/**
+ * Build the `{id, value}` model option that sets reasoning effort for a
+ * harness. Drivers without a known effort option fail loudly rather than
+ * having the value silently dropped.
+ */
+export function effortOptions(provider: Provider, effort: string): ModelSelectionOption[] {
+  const value = effort.trim();
+  if (!value) throw new Error("effort must not be empty.");
+  const id = EFFORT_OPTION_ID[provider.driver];
+  if (!id) {
+    throw new Error(
+      `harness "${provider.instanceId}" (driver ${provider.driver}) has no known effort setting. Supported drivers: ${Object.keys(
+        EFFORT_OPTION_ID,
+      ).join(", ")}.`,
+    );
+  }
+  return [{ id, value }];
 }
 
 export interface WorktreeChoice {

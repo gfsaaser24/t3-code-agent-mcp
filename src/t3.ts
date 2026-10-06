@@ -54,6 +54,8 @@ export interface TurnStartSpec {
   text: string;
   runtimeMode: RuntimeMode;
   interactionMode: InteractionMode;
+  /** Set to change the thread's model options (e.g. effort) with this turn. */
+  modelSelection?: ModelSelection;
 }
 
 export interface WaitOptions {
@@ -161,6 +163,7 @@ export class T3Api {
       commandId: spec.commandId,
       threadId: spec.threadId,
       message: { messageId: spec.messageId, role: "user", text: spec.text, attachments: [] },
+      ...(spec.modelSelection ? { modelSelection: spec.modelSelection } : {}),
       runtimeMode: spec.runtimeMode,
       interactionMode: spec.interactionMode,
       createdAt: new Date().toISOString(),
