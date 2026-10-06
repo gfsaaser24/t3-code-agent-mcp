@@ -174,6 +174,81 @@ describe("t3_send_message", () => {
   });
 });
 
+describe("effort", () => {
+  const codexProvider: Provider = { ...provider, instanceId: "codex", driver: "codex", models: [{ slug: "gpt-x", name: "GPT" }] };
+  const cursorProvider: Provider = { ...provider, instanceId: "cursor", driver: "cursor", models: [{ slug: "claude-sonnet-5-5", name: "Sonnet" }] };
+  const otherProvider: Provider = { ...provider, instanceId: "opencode", driver: "opencode", models: [{ slug: "auto", name: "Auto" }] };
+
+  it("create_thread sends effort as an {id, value} list: `effort` for claude, `reasoningEffort` for codex, `reasoning` for cursor", async () => {
+    const specs: Array<{ modelSelection: unknown }> = [];
+    const call = harness({
+      shell: async () => shell([]),
+      config: async () => ({ providers: [provider, codexProvider, cursorProvider] }),
+      listRefs: async () => refs,
+      createThreadWithFirstTurn: async (spec) => {
+        specs.push(spec);
+        return { sequence: 1 };
+      },
+      thread: async (id: string) => detail(threadShell(id, null)),
+    });
+    await call("t3_create_thread", { ...base("e1"), effort: "high" });
+    await call("t3_create_thread", { ...base("e2"), harness: "codex", model: "gpt-x", effort: "xhigh" });
+    expect(specs[0]!.modelSelection).toEqual({ instanceId: "claudeAgent", model: "claude-opus-5", options: [{ id: "effort", value: "high" }] });
+    expect(specs[1]!.modelSelection).toEqual({ instanceId: "codex", model: "gpt-x", options: [{ id: "reasoningEffort", value: "xhigh" }] });
+    await call("t3_create_thread", { ...base("e5"), harness: "cursor", model: "claude-sonnet-5-5", effort: "high" });
+    expect(specs[2]!.modelSelection).toEqual({ instanceId: "cursor", model: "claude-sonnet-5-5", options: [{ id: "reasoning", value: "high" }] });
+  });
+
+  it("create_thread without effort leaves options off, and rejects effort on a harness with no known setting", async () => {
+    const specs: Array<{ modelSelection: Record<string, unknown> }> = [];
+    const call = harness({
+      shell: async () => shell([]),
+      config: async () => ({ providers: [provider, otherProvider] }),
+      listRefs: async () => refs,
+      createThreadWithFirstTurn: async (spec) => {
+        specs.push(spec);
+        return { sequence: 1 };
+      },
+      thread: async (id: string) => detail(threadShell(id, null)),
+    });
+    await call("t3_create_thread", base("e3"));
+    expect("options" in specs[0]!.modelSelection).toBe(false);
+    const rejected = await call("t3_create_thread", { ...base("e4"), harness: "opencode", model: "auto", effort: "high" });
+    expect(rejected.error).toMatch(/no known effort setting/);
+    expect(specs).toHaveLength(1);
+  });
+
+  it("send_message carries the thread's model selection with the new effort, and reports options back", async () => {
+    const started: Array<{ modelSelection?: unknown }> = [];
+    const withEffort = threadShell("t1", null);
+    withEffort.modelSelection = { ...withEffort.modelSelection, options: [{ id: "effort", value: "high" }] };
+    const call = harness({
+      thread: async () => detail(withEffort),
+      config: async () => ({ providers: [provider] }),
+      startTurn: async (spec) => {
+        started.push(spec);
+        return { sequence: 2 };
+      },
+    });
+    const result = await call("t3_send_message", { threadId: "t1", prompt: "p", effort: "low", idempotencyKey: "s1" });
+    expect(started[0]!.modelSelection).toEqual({ instanceId: "claudeAgent", model: "claude-opus-5", options: [{ id: "effort", value: "low" }] });
+    expect(result.options).toEqual([{ id: "effort", value: "high" }]);
+  });
+
+  it("send_message without effort does not send a modelSelection", async () => {
+    const started: Array<{ modelSelection?: unknown }> = [];
+    const call = harness({
+      thread: async () => detail(threadShell("t1", null)),
+      startTurn: async (spec) => {
+        started.push(spec);
+        return { sequence: 2 };
+      },
+    });
+    await call("t3_send_message", { threadId: "t1", prompt: "p", idempotencyKey: "s2" });
+    expect(started[0]!.modelSelection).toBeUndefined();
+  });
+});
+
 describe("t3_list_harnesses", () => {
   it("hides unusable harnesses by default and explains them when asked", async () => {
     const signedOut: Provider = { ...provider, instanceId: "codex", driver: "codex", auth: { status: "unauthenticated" } };

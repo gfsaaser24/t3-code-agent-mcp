@@ -6,13 +6,26 @@ import { z } from "zod";
 
 import { commandIds } from "./ids.js";
 import { registerOrchestrationPromptTool } from "./prompts.js";
-import { normalizePath, resolveExistingWorktree, resolveHarness, resolveModel, resolveProject, unusableReason } from "./resolve.js";
+import {
+  effortOptions,
+  normalizePath,
+  resolveExistingWorktree,
+  resolveHarness,
+  resolveModel,
+  resolveProject,
+  unusableReason,
+} from "./resolve.js";
 import type { T3Api } from "./t3.js";
-import type { Message, ThreadDetailSnapshot, ThreadShell } from "./types.js";
+import type { Message, ModelSelection, ThreadDetailSnapshot, ThreadShell } from "./types.js";
 
 const RuntimeModeSchema = z.enum(["approval-required", "auto-accept-edits", "auto", "full-access"]);
 const InteractionModeSchema = z.enum(["default", "plan"]);
 const ContextSchema = z.array(z.object({ label: z.string().optional(), text: z.string() })).optional();
+const EffortSchema = z
+  .string()
+  .min(1)
+  .optional()
+  .describe("Reasoning effort, e.g. low, medium, high, xhigh. Sets `effort` on claudeAgent and `reasoningEffort` on codex; other harnesses are rejected. Verify with t3_get_thread (`options`).");
 
 export interface ToolContext {
   api: T3Api;
@@ -32,6 +45,7 @@ const summarizeThread = (thread: ThreadShell | ThreadDetailSnapshot["thread"], c
   projectId: thread.projectId,
   harness: thread.modelSelection.instanceId,
   model: thread.modelSelection.model,
+  options: thread.modelSelection.options ?? [],
   branch: thread.branch,
   worktreePath: thread.worktreePath,
   runtimeMode: thread.runtimeMode,
@@ -245,6 +259,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           })
           .optional()
           .describe("Ask T3 to create a fresh worktree for this thread. Mutually exclusive with worktreePath."),
+        effort: EffortSchema,
         runtimeMode: RuntimeModeSchema.optional().describe("Default full-access"),
         interactionMode: InteractionModeSchema.optional().describe("Default 'default'; 'plan' asks for a plan first"),
         idempotencyKey: z.string().optional().describe("Stable key; retries with the same key reuse the same thread instead of launching again"),
@@ -258,6 +273,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const project = resolveProject(shell.projects, input.project);
       const harness = resolveHarness(config.providers, input.harness);
       const model = resolveModel(harness, input.model);
+      const options = input.effort ? effortOptions(harness, input.effort) : undefined;
       const ids = commandIds("launch", input.idempotencyKey);
       const runtimeMode = input.runtimeMode ?? "full-access";
       const interactionMode = input.interactionMode ?? "default";
@@ -302,7 +318,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           ...ids,
           projectId: project.id,
           title: input.title,
-          modelSelection: { instanceId: harness.instanceId, model: model.slug },
+          modelSelection: { instanceId: harness.instanceId, model: model.slug, ...(options ? { options } : {}) },
           runtimeMode,
           interactionMode,
           branch,
@@ -334,6 +350,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         threadId: z.string(),
         prompt: z.string().min(1),
         context: ContextSchema,
+        effort: EffortSchema,
         runtimeMode: RuntimeModeSchema.optional().describe("Default: the thread's current mode"),
         interactionMode: InteractionModeSchema.optional().describe("Default: the thread's current mode"),
         idempotencyKey: z.string().optional().describe("Stable key; retries with the same key do not start a second turn"),
@@ -348,9 +365,19 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       // No "turn is running" guard on purpose: T3 accepts thread.turn.start
       // mid-turn and forwards it to the harness as steering, same as the UI.
       if (!alreadySent) {
+        let modelSelection: ModelSelection | undefined;
+        if (input.effort) {
+          const { providers } = await api.config();
+          const provider = providers.find((p) => p.instanceId === before.thread.modelSelection.instanceId);
+          if (!provider) {
+            throw new Error(`harness "${before.thread.modelSelection.instanceId}" of this thread is not configured in T3, so effort cannot be set.`);
+          }
+          modelSelection = { ...before.thread.modelSelection, options: effortOptions(provider, input.effort) };
+        }
         // Safe even if the message landed after our read: T3 replays the
         // accepted receipt for a repeated commandId instead of starting again.
         await api.startTurn({
+          ...(modelSelection ? { modelSelection } : {}),
           ...ids,
           threadId: input.threadId,
           text: composeMessage(input.prompt, input.context),
